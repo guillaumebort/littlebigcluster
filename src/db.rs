@@ -1,18 +1,25 @@
 use std::{
     any::Any,
     borrow::Cow,
+    fmt::Debug,
     fs::File,
+    future::Future,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use futures::{future::BoxFuture, FutureExt};
+use parking_lot::Mutex;
 use rusqlite::{types::FromSql, Connection, DatabaseName, OpenFlags, Params, Transaction};
 use tempfile::TempDir;
-use tokio::{runtime::Handle, sync::SemaphorePermit};
+use tokio::{runtime::Handle, sync::oneshot, sync::SemaphorePermit};
 use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::debug;
 
+type DoAck = oneshot::Sender<bool>;
 type Factory = Arc<dyn Fn() -> Result<Connection> + Send + Sync>;
 type Thunk = Box<dyn FnOnce(&mut Connection) -> Result<Box<dyn Any + Send>> + Send>;
 type Callback = tokio::sync::oneshot::Sender<Result<Box<dyn Any + Send>>>;
@@ -22,8 +29,15 @@ pub struct DB {
     internal_factory: Factory,
     read_pool: Pool,
     write_pool: Pool,
+    pending_acks: Arc<Mutex<Vec<DoAck>>>,
     #[allow(unused)]
     tmp: Arc<TempDir>,
+}
+
+impl Debug for DB {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DB").field("tmp", &self.tmp).finish()
+    }
 }
 
 fn db_path(connection: &Connection) -> &str {
@@ -41,9 +55,11 @@ fn shm_path(connection: &Connection) -> PathBuf {
 impl DB {
     pub async fn open(snapshot: Option<&Path>) -> Result<Self> {
         let tmp = Arc::new(TempDir::new()?);
-        let db_path = tmp.path().join("littlecluster.db");
+        let db_path = tmp.path().join("litecluster.db");
+        debug!(?db_path, ?snapshot, "Opening DB");
         // restore snapshot or create empty db
         if let Some(snapshot) = snapshot {
+            std::fs::copy(snapshot, "/tmp/wat")?;
             std::fs::copy(snapshot, &db_path)?;
         } else {
             // create empty db
@@ -59,6 +75,9 @@ impl DB {
             .await
             .context(format!("failed to initialize db at {db_path:?}"))??;
         }
+
+        // to deliver the acks signals
+        let pending_acks = Arc::new(Mutex::new(Vec::with_capacity(1_024)));
 
         // these connections will be used internally
         let internal_factory = {
@@ -103,7 +122,7 @@ impl DB {
                 connection.pragma_update(None, "wal_autocheckpoint", "0")?;
                 Ok(connection)
             });
-            Pool::new(1, 10, factory)
+            Pool::new(1, 10, factory, pending_acks.clone())
         }?;
 
         // the read pool has a connection per core but is read only
@@ -115,7 +134,12 @@ impl DB {
                 assert!(connection.is_readonly(DatabaseName::Main)?);
                 Ok(connection)
             });
-            Pool::new(num_cpus::get().try_into()?, 10, factory)
+            Pool::new(
+                num_cpus::get().try_into()?,
+                10,
+                factory,
+                pending_acks.clone(),
+            )
         }?;
 
         Ok(Self {
@@ -123,6 +147,7 @@ impl DB {
             internal_factory,
             read_pool,
             write_pool,
+            pending_acks,
         })
     }
 
@@ -130,31 +155,57 @@ impl DB {
         &self,
         sql: impl Into<Cow<'static, str>>,
         params: impl Params + Send + 'static,
-    ) -> Result<usize> {
+    ) -> Result<impl Future<Output = Result<usize>>> { // TODO: box the Acks
+        let (do_ack, ack) = oneshot::channel();
         let sql = sql.into();
-        Self::call(&self.write_pool, move |c| {
-            Ok(c.execute(sql.as_ref(), params)?)
-        })
-        .await
+        let result = Self::call(
+            &self.write_pool,
+            move |c| Ok(c.execute(sql.as_ref(), params)?),
+            Some(do_ack),
+        )
+        .await?;
+        Ok(ack.map(move |r| match r {
+            Ok(true) => Ok(result),
+            _ => Err(anyhow!("checkpoint failed")),
+        }))
     }
 
-    pub async fn execute_batch(&self, sql: impl Into<Cow<'static, str>>) -> Result<()> {
+    pub async fn execute_batch(
+        &self,
+        sql: impl Into<Cow<'static, str>>,
+    ) -> Result<impl Future<Output = Result<()>>> {
+        let (do_ack, ack) = oneshot::channel();
         let sql = sql.into();
         Self::call(
             &self.write_pool,
             move |c| Ok(c.execute_batch(sql.as_ref())?),
+            Some(do_ack),
         )
-        .await
+        .await?;
+        Ok(ack.map(|r| match r {
+            Ok(true) => Ok(()),
+            _ => Err(anyhow!("checkpoint failed")),
+        }))
     }
 
     pub async fn transaction<A>(
         &self,
         thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
-    ) -> Result<A>
+    ) -> Result<impl Future<Output = Result<A>>>
     where
         A: Send + 'static,
     {
-        Self::call(&self.write_pool, move |c| Ok(thunk(c.transaction()?)?)).await
+        let (do_ack, ack) = oneshot::channel();
+        let result = Self::call(
+            &self.write_pool,
+            move |c| Ok(thunk(c.transaction()?)?),
+            Some(do_ack),
+        )
+        .await?;
+        Ok(ack.map(move |r| match r {
+            Ok(true) => Ok(result),
+            _ => Err(anyhow!("checkpoint failed")),
+        }))
     }
 
     pub async fn query_row<A>(
@@ -167,9 +218,37 @@ impl DB {
         A: Send + 'static,
     {
         let sql = sql.into();
-        Self::call(&self.read_pool, move |c| {
-            c.query_row_and_then(sql.as_ref(), params, |row| f(row))
-        })
+        Self::call(
+            &self.read_pool,
+            move |c| c.query_row_and_then(sql.as_ref(), params, |row| f(row)),
+            None,
+        )
+        .await
+    }
+
+    pub async fn query_row_opt<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>>,
+        params: impl Params + Send + 'static,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
+    ) -> Result<Option<A>>
+    where
+        A: Send + 'static,
+    {
+        let sql = sql.into();
+        Self::call(
+            &self.read_pool,
+            move |c| {
+                let mut stmt = c.prepare(&sql)?;
+                let mut rows = stmt.query(params)?;
+                if let Some(row) = rows.next()? {
+                    f(row).map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            None,
+        )
         .await
     }
 
@@ -182,9 +261,11 @@ impl DB {
         A: FromSql + Send + 'static,
     {
         let sql = sql.into();
-        Self::call(&self.read_pool, move |c| {
-            Ok(c.query_row(sql.as_ref(), params, |row| row.get(0))?)
-        })
+        Self::call(
+            &self.read_pool,
+            move |c| Ok(c.query_row(sql.as_ref(), params, |row| row.get(0))?),
+            None,
+        )
         .await
     }
 
@@ -195,12 +276,13 @@ impl DB {
     where
         A: Send + 'static,
     {
-        Self::call(&self.read_pool, move |c| Ok(thunk(c.transaction()?)?)).await
+        Self::call(&self.read_pool, move |c| Ok(thunk(c.transaction()?)?), None).await
     }
 
     async fn call<A>(
         pool: &Pool,
         thunk: impl FnOnce(&mut Connection) -> Result<A> + Send + 'static,
+        maybe_do_ack: Option<DoAck>,
     ) -> Result<A>
     where
         A: Send + 'static,
@@ -212,6 +294,7 @@ impl DB {
                 Ok(Box::new(result) as Box<dyn Any + Send>)
             }),
             tx,
+            maybe_do_ack,
         )
         .await?;
         rx.await
@@ -225,14 +308,46 @@ impl DB {
             })
     }
 
-    pub(crate) async fn checkpoint(&self, wal_snapshot: impl Into<PathBuf>) -> Result<()> {
+    pub(crate) async fn checkpoint<A>(
+        &self,
+        f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
+    ) -> Result<A>
+    where
+        A: Send + 'static,
+    {
         let _guard = self.write_pool.block().await?;
-        let wal_snapshot = wal_snapshot.into();
         let factory = self.internal_factory.clone();
+        let pending_acks = self.pending_acks.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let connection = factory()?;
+            let wal_path = wal_path(&connection);
+            let result = Handle::current().block_on(f(wal_path))?;
+            connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+            // TODO: This look too slow
+            for do_ack in pending_acks.lock().drain(..) {
+                let _ = do_ack.send(true);
+            }
+            anyhow::Ok(result)
+        })
+        .await?;
+        result
+    }
+
+    pub(crate) async fn rollback(&self) -> Result<()> {
+        let _write_guard = self.write_pool.block().await?;
+        let _read_guard = self.read_pool.block().await?;
+        let factory = self.internal_factory.clone();
+        let pending_acks = self.pending_acks.clone();
         tokio::task::spawn_blocking(move || {
             let connection = factory()?;
-            std::fs::copy(wal_path(&connection), wal_snapshot)?;
+            let wal_path = wal_path(&connection);
+            std::fs::File::create(wal_path)?; // truncate wal file
+            Self::invalidate_shm(&connection)?;
+            // truncate properly
             connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+            for do_ack in pending_acks.lock().drain(..) {
+                let _ = do_ack.send(false);
+            }
             anyhow::Ok(())
         })
         .await??;
@@ -260,8 +375,6 @@ impl DB {
         let wal_snapshot = wal_snapshot.into();
         tokio::task::spawn_blocking(move || {
             let connection = factory()?;
-
-            let shm_path = shm_path(&connection);
             let wal_path = wal_path(&connection);
 
             // truncate wal file
@@ -270,20 +383,7 @@ impl DB {
             // replace the wal file
             std::fs::copy(&wal_snapshot, &wal_path)?;
 
-            // read the -shm file and update the header
-            if !shm_path.exists() {
-                bail!("missing shm file: {shm_path:?}");
-            }
-            const WALINDEX_HEADER_SIZE: usize = 136;
-            let mut shm_file = File::options().read(true).write(true).open(&shm_path)?;
-            let mut buf = vec![0u8; WALINDEX_HEADER_SIZE];
-            shm_file.read_exact(&mut buf)?;
-
-            // clears the iVersion fields so the next transaction will rebuild it
-            buf[12] = 0;
-            buf[60] = 0;
-            shm_file.rewind()?;
-            shm_file.write_all(&buf)?;
+            Self::invalidate_shm(&connection)?;
 
             // truncate wal file again
             connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
@@ -292,19 +392,45 @@ impl DB {
         .await??;
         Ok(())
     }
+
+    fn invalidate_shm(connection: &Connection) -> Result<()> {
+        let shm_path = shm_path(&connection);
+
+        // read the -shm file and update the header
+        if !shm_path.exists() {
+            bail!("missing shm file: {shm_path:?}");
+        }
+        const WALINDEX_HEADER_SIZE: usize = 136;
+        let mut shm_file = File::options().read(true).write(true).open(&shm_path)?;
+        let mut buf = vec![0u8; WALINDEX_HEADER_SIZE];
+        shm_file.read_exact(&mut buf)?;
+
+        // clears the iVersion fields so the next transaction will rebuild it
+        buf[12] = 0;
+        buf[60] = 0;
+        shm_file.rewind()?;
+        shm_file.write_all(&buf)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 struct Pool {
     tasks_count: u32,
-    tx: async_channel::Sender<(Thunk, Callback)>,
+    tx: async_channel::Sender<(Thunk, Callback, Option<DoAck>)>,
     semaphore: Arc<tokio::sync::Semaphore>,
     #[allow(unused)]
     cancel: Arc<DropGuard>,
 }
 
 impl Pool {
-    pub fn new(tasks_count: u32, max_pending: usize, factory: Factory) -> Result<Self> {
+    pub fn new(
+        tasks_count: u32,
+        max_pending: usize,
+        factory: Factory,
+        pending_acks: Arc<Mutex<Vec<DoAck>>>,
+    ) -> Result<Self> {
         let (tx, rx) = async_channel::bounded(max_pending);
         let cancel = CancellationToken::new();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(tasks_count.try_into()?));
@@ -313,8 +439,9 @@ impl Pool {
             let rx = rx.clone();
             let cancel = cancel.child_token();
             let semaphore = semaphore.clone();
+            let pending_acks = pending_acks.clone();
             tokio::task::spawn_blocking(|| {
-                Handle::current().block_on(Self::run(factory, rx, cancel, semaphore))
+                Handle::current().block_on(Self::run(factory, rx, cancel, semaphore, pending_acks))
             });
         }
         let cancel = cancel.drop_guard().into();
@@ -326,9 +453,14 @@ impl Pool {
         })
     }
 
-    async fn call(&self, thunk: Thunk, callback: Callback) -> Result<()> {
+    async fn call(
+        &self,
+        thunk: Thunk,
+        callback: Callback,
+        maybe_do_ack: Option<DoAck>,
+    ) -> Result<()> {
         self.tx
-            .send((thunk, callback))
+            .send((thunk, callback, maybe_do_ack))
             .await
             .map_err(|t| anyhow!("{t:?}"))
             .context("failed to send call to pool")
@@ -340,16 +472,25 @@ impl Pool {
 
     async fn run(
         factory: Factory,
-        rx: async_channel::Receiver<(Thunk, Callback)>,
+        rx: async_channel::Receiver<(Thunk, Callback, Option<DoAck>)>,
         cancel: CancellationToken,
         semaphore: Arc<tokio::sync::Semaphore>,
+        pending_acks: Arc<Mutex<Vec<DoAck>>>,
     ) -> Result<()> {
         let mut connection = factory()?;
         while !cancel.is_cancelled() {
-            let (thunk, tx) = rx.recv().await?;
+            let (thunk, tx, maybe_do_ack) = rx.recv().await?;
             let result = {
                 let _permit = semaphore.acquire().await?;
-                thunk(&mut connection)
+                match thunk(&mut connection) {
+                    Ok(a) => {
+                        if let Some(do_ack) = maybe_do_ack {
+                            pending_acks.lock().push(do_ack);
+                        }
+                        Ok(a)
+                    }
+                    Err(e) => Err(e),
+                }
             };
             tx.send(result)
                 .map_err(|t| anyhow!("{t:?}"))
@@ -361,8 +502,12 @@ impl Pool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::atomic::AtomicUsize,
+        time::{Duration, Instant},
+    };
 
+    use futures::FutureExt;
     use rand::Rng;
     use tempfile::NamedTempFile;
 
@@ -378,13 +523,14 @@ mod tests {
     #[tokio::test]
     async fn open_and_insert() -> Result<()> {
         let db = DB::open(None).await?;
-        db.execute_batch(
-            r#"
+        let _ = db
+            .execute_batch(
+                r#"
             CREATE TABLE batchs(uuid);
             INSERT INTO batchs VALUES ('0191b6d0-3d9a-7eb1-88b8-5312737f2ca0');
         "#,
-        )
-        .await?;
+            )
+            .await?;
         assert_eq!(
             "0191b6d0-3d9a-7eb1-88b8-5312737f2ca0",
             db.query_scalar::<String>("select * from batchs", [])
@@ -407,17 +553,18 @@ mod tests {
     async fn snapshot() -> Result<()> {
         // create a blank db, insert some data
         let db = DB::open(None).await?;
-        db.transaction(|txn| {
-            txn.execute("CREATE TABLE batchs(uuid)", [])?;
-            {
-                let mut stmt = txn.prepare_cached("INSERT INTO batchs VALUES (?1)")?;
-                for i in 0..100 {
-                    stmt.execute([i.to_string()])?;
+        let _ = db
+            .transaction(|txn| {
+                txn.execute("CREATE TABLE batchs(uuid)", [])?;
+                {
+                    let mut stmt = txn.prepare_cached("INSERT INTO batchs VALUES (?1)")?;
+                    for i in 0..100 {
+                        stmt.execute([i.to_string()])?;
+                    }
                 }
-            }
-            txn.commit()
-        })
-        .await?;
+                txn.commit()
+            })
+            .await?;
 
         // snaphot the db
         let tmp = TempDir::new()?;
@@ -437,18 +584,19 @@ mod tests {
     #[tokio::test]
     async fn auto_rollback_transactions() -> Result<()> {
         let db = DB::open(None).await?;
-        db.execute_batch("CREATE TABLE batchs(uuid)").await?;
+        let _ = db.execute_batch("CREATE TABLE batchs(uuid)").await?;
 
         // transaction rollback
-        db.transaction(|txn| {
-            txn.execute(
-                "INSERT INTO batchs VALUES ('0191b6d0-3d9a-7eb1-88b8-5312737f2ca0')",
-                [],
-            )?;
-            // oops forgot to commit
-            Ok(())
-        })
-        .await?;
+        let _ = db
+            .transaction(|txn| {
+                txn.execute(
+                    "INSERT INTO batchs VALUES ('0191b6d0-3d9a-7eb1-88b8-5312737f2ca0')",
+                    [],
+                )?;
+                // oops forgot to commit
+                Ok(())
+            })
+            .await?;
 
         // the transaction was rolled back
         assert_eq!(
@@ -462,31 +610,46 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint() -> Result<()> {
-        let tmp = TempDir::new()?;
-
         // create a blank db, create a table
         let db = DB::open(None).await?;
-        db.execute_batch("CREATE TABLE batchs(uuid)").await?;
+        let _ = db.execute_batch("CREATE TABLE batchs(uuid)").await?;
 
         // checkpoint the db
-        let wal_snapshot_1 = tmp.path().join("wal_snapshot_1");
-        db.checkpoint(&wal_snapshot_1).await?;
-        assert!(wal_snapshot_1.exists());
+        let wal_snapshot_1 = db
+            .checkpoint(|wal| {
+                async {
+                    let tmp = NamedTempFile::new()?;
+                    std::fs::copy(wal, tmp.path())?;
+                    Ok(tmp)
+                }
+                .boxed()
+            })
+            .await?;
+        assert!(wal_snapshot_1.path().exists());
 
         // transaction rollback
-        db.transaction(|txn| {
-            txn.execute(
-                "INSERT INTO batchs VALUES ('0191b6d0-3d9a-7eb1-88b8-5312737f2ca0')",
-                [],
-            )?;
-            txn.rollback()
-        })
-        .await?;
+        let _ = db
+            .transaction(|txn| {
+                txn.execute(
+                    "INSERT INTO batchs VALUES ('0191b6d0-3d9a-7eb1-88b8-5312737f2ca0')",
+                    [],
+                )?;
+                txn.rollback()
+            })
+            .await?;
 
         // checkpoint the db
-        let wal_snapshot_2 = tmp.path().join("wal_snapshot_2");
-        db.checkpoint(&wal_snapshot_2).await?;
-        assert!(wal_snapshot_2.exists());
+        let wal_snapshot_2 = db
+            .checkpoint(|wal| {
+                async {
+                    let tmp = NamedTempFile::new()?;
+                    std::fs::copy(wal, tmp.path())?;
+                    Ok(tmp)
+                }
+                .boxed()
+            })
+            .await?;
+        assert!(wal_snapshot_2.path().exists());
 
         // check the db content
         assert_eq!(
@@ -496,16 +659,26 @@ mod tests {
         );
 
         // insert some data
-        db.execute(
-            "INSERT INTO batchs VALUES (?1)",
-            [("0191b6d0-3d9a-7eb1-88b8-5312737f2ca0")],
-        )
-        .await?;
+        let ack_3 = db
+            .execute(
+                "INSERT INTO batchs VALUES (?1)",
+                [("0191b6d0-3d9a-7eb1-88b8-5312737f2ca0")],
+            )
+            .await?;
 
         // checkpoint the db
-        let wal_snapshot_3 = tmp.path().join("wal_snapshot_3");
-        db.checkpoint(&wal_snapshot_3).await?;
-        assert!(wal_snapshot_3.exists());
+        let wal_snapshot_3 = db
+            .checkpoint(|wal| {
+                async {
+                    let tmp = NamedTempFile::new()?;
+                    std::fs::copy(wal, tmp.path())?;
+                    Ok(tmp)
+                }
+                .boxed()
+            })
+            .await?;
+        assert!(wal_snapshot_3.path().exists());
+        assert_eq!(1, ack_3.await?);
 
         // check the db content
         assert_eq!(
@@ -516,7 +689,7 @@ mod tests {
 
         // create a new blank db, restore the first checkpoint
         let db = DB::open(None).await?;
-        db.apply_wal(&wal_snapshot_1).await?;
+        db.apply_wal(&wal_snapshot_1.path()).await?;
         assert_eq!(
             0,
             db.query_scalar::<i32>("select count(*) from batchs", [])
@@ -524,7 +697,7 @@ mod tests {
         );
 
         // restore the second checkpoint
-        db.apply_wal(&wal_snapshot_2).await?;
+        db.apply_wal(&wal_snapshot_2.path()).await?;
         assert_eq!(
             0,
             db.query_scalar::<i32>("select count(*) from batchs", [])
@@ -532,7 +705,7 @@ mod tests {
         );
 
         // restore the third checkpoint
-        db.apply_wal(&wal_snapshot_3).await?;
+        db.apply_wal(&wal_snapshot_3.path()).await?;
         assert_eq!(
             1,
             db.query_scalar::<i32>("select count(*) from batchs", [])
@@ -550,6 +723,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback() -> Result<()> {
+        // create a blank db, create a table
+        let db = DB::open(None).await?;
+        let _ = db.execute_batch("CREATE TABLE batchs(uuid)").await?;
+
+        // checkpoint the db
+        let wal_snapshot_1 = db
+            .checkpoint(|wal| {
+                async {
+                    let tmp = NamedTempFile::new()?;
+                    std::fs::copy(wal, tmp.path())?;
+                    Ok(tmp)
+                }
+                .boxed()
+            })
+            .await?;
+        assert!(wal_snapshot_1.path().exists());
+
+        // insert some data
+        let ack_1 = db
+            .execute(
+                "INSERT INTO batchs VALUES (?1)",
+                [("0191b6d0-3d9a-7eb1-88b8-5312737f2ca0")],
+            )
+            .await?;
+
+        // check the db content
+        assert_eq!(
+            1,
+            db.query_scalar::<i32>("select count(*) from batchs", [])
+                .await?,
+        );
+
+        // but now rollback the current wal
+        db.rollback().await?;
+
+        assert!(ack_1.await.is_err());
+
+        // check the db content
+        assert_eq!(
+            0,
+            db.query_scalar::<i32>("select count(*) from batchs", [])
+                .await?,
+        );
+
+        // insert some data
+        let ack_2 = db
+            .execute(
+                "INSERT INTO batchs VALUES (?1)",
+                [("0191b6d0-3d9a-7eb1-88b8-5312737f2ca0")],
+            )
+            .await?;
+
+        // check the db content
+        assert_eq!(
+            1,
+            db.query_scalar::<i32>("select count(*) from batchs", [])
+                .await?,
+        );
+
+        // checkpoint the db
+        let wal_snapshot_2 = db
+            .checkpoint(|wal| {
+                async {
+                    let tmp = NamedTempFile::new()?;
+                    std::fs::copy(wal, tmp.path())?;
+                    Ok(tmp)
+                }
+                .boxed()
+            })
+            .await?;
+        assert!(wal_snapshot_2.path().exists());
+
+        assert!(ack_2.await.is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn block_pool() -> Result<()> {
         let leader = DB::open(None).await?;
 
@@ -562,6 +814,7 @@ mod tests {
             .call(
                 Box::new(|c| Ok(c.query_row("select 1", [], |_| Ok(Box::new(1)))?)),
                 tx,
+                None,
             )
             .await?;
 
@@ -583,23 +836,24 @@ mod tests {
         let test_duration = Duration::from_secs(15);
 
         let leader = DB::open(None).await?;
-        leader.execute_batch("CREATE TABLE batchs(uuid)").await?;
+        let _ = leader.execute_batch("CREATE TABLE batchs(uuid)").await?;
 
         let snapshot = log.path().join("snapshot");
         leader.snapshot(&snapshot).await?;
         assert!(snapshot.exists());
 
         let follower = DB::open(Some(&snapshot)).await?;
+        let inserted = Arc::new(AtomicUsize::new(0));
 
         let write_loop = tokio::spawn({
             let leader = leader.clone();
+            let inserted = inserted.clone();
             async move {
                 let start = Instant::now();
                 let mut t = Instant::now();
-                let mut inserted = 0;
                 let mut i = 0;
                 loop {
-                    inserted += leader
+                    let ack = leader
                         .transaction(move |txn| {
                             {
                                 let mut stmt =
@@ -616,6 +870,15 @@ mod tests {
                         })
                         .await
                         .unwrap();
+                    tokio::spawn({
+                        let inserted = inserted.clone();
+                        async move {
+                            inserted.fetch_add(
+                                ack.await.unwrap_or_default(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                    });
                     i += 1;
                     if t.elapsed() > Duration::from_millis(100) {
                         println!("leader: inserted {} rows", i);
@@ -623,7 +886,7 @@ mod tests {
                         i = 0;
                     }
                     if start.elapsed() > test_duration {
-                        return inserted;
+                        break;
                     }
                 }
             }
@@ -636,14 +899,31 @@ mod tests {
             async move {
                 let mut i = 0;
                 loop {
-                    let wal = log.path().join(format!("wal_{}", i));
-                    let tmp = NamedTempFile::new_in(log.path()).unwrap();
-                    if let Err(e) = leader.checkpoint(tmp.path()).await {
-                        println!("leader: checkpoint error: {e}");
+                    if rand::thread_rng().gen_bool(0.2) {
+                        leader.rollback().await.unwrap();
+                        println!("leader: rollbacked current wal",);
                     } else {
-                        std::fs::rename(tmp.path(), &wal).unwrap();
-                        println!("leader: checkpointed {}", wal.display());
-                        i += 1;
+                        let wal = log.path().join(format!("wal_{}", i));
+                        match leader
+                            .checkpoint(|wal| {
+                                async {
+                                    let tmp = NamedTempFile::new().unwrap();
+                                    std::fs::copy(wal, tmp.path())?;
+                                    Ok(tmp)
+                                }
+                                .boxed()
+                            })
+                            .await
+                        {
+                            Ok(tmp) => {
+                                std::fs::rename(tmp.path(), &wal).unwrap();
+                                println!("leader: checkpointed {}", wal.display());
+                                i += 1;
+                            }
+                            Err(e) => {
+                                println!("leader: checkpoint error: {e}");
+                            }
+                        }
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -683,10 +963,10 @@ mod tests {
             }
         });
 
-        let total_inserted = write_loop.await?;
+        write_loop.await?;
+        let total_seen_by_replica = replication_loop.await?.try_into()?;
+        let total_inserted = inserted.load(std::sync::atomic::Ordering::Relaxed);
         println!("TOTAL inserted: {}", total_inserted);
-
-        let total_seen_by_replica = replication_loop.await?;
         println!("TOTAL seen by replica: {}", total_seen_by_replica);
 
         assert_eq!(total_inserted, total_seen_by_replica);

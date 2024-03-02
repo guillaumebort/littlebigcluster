@@ -6,20 +6,15 @@ use object_store::ObjectStore;
 use parking_lot::RwLock;
 use rusqlite::{types::FromSql, Params, Transaction};
 use serde::de;
-use tokio::select;
 use tokio::task::JoinSet;
+use tokio::{select, task::JoinHandle};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::manifest::{Leadership, Manifest, ManifestData};
+use crate::replica::Replica;
 
-pub trait Member {
-    type Manifest: ManifestData;
-
-    fn manifest(&self) -> Self::Manifest;
-}
-
-pub trait Follower: Member {
+pub trait Follower {
     // fn query_row<A>(
     //     &self,
     //     sql: impl Into<Cow<'static, str>> + Send,
@@ -69,158 +64,89 @@ pub trait Leader: Follower {
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    uuid: Uuid,
-    address: SocketAddr,
-    cluster_id: String,
-    object_store: Arc<dyn ObjectStore>,
+    pub uuid: Uuid,
+    pub address: SocketAddr,
+    pub cluster_id: String,
 }
 
 impl Node {
-    pub fn new(cluster_id: String, object_store: Arc<dyn ObjectStore>) -> Self {
+    pub fn new(cluster_id: String) -> Self {
         let uuid = Uuid::now_v7();
         let address = "127.0.0.1:8000".parse().unwrap();
         Self {
             uuid,
             address,
             cluster_id,
-            object_store,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct LeaderNode<M>
-where
-    M: ManifestData,
-{
-    node: Node,
-    manifest: Arc<RwLock<Manifest<M>>>,
-    tasks: JoinSet<()>,
+pub struct LeaderNode {
+    keep_alive: JoinHandle<Replica>,
+    cancel: DropGuard,
 }
 
-impl<M> LeaderNode<M>
-where
-    M: ManifestData,
-{
-    pub async fn wait_for_leadership(node: Node) -> Result<Self> {
+impl LeaderNode {
+    pub async fn join(node: Node, object_store: Arc<dyn ObjectStore>) -> Result<Self> {
+        info!("Joining cluster...");
+        let replica = Replica::open(&node.cluster_id, object_store).await?;
+        Self::wait_for_leadership(node, replica).await
+    }
+
+    async fn wait_for_leadership(node: Node, mut replica: Replica) -> Result<Self> {
         info!("Waiting for leadership...");
-        let mut manifest = Manifest::<M>::watch(
-            node.cluster_id.clone(),
-            node.object_store.clone(),
-            Duration::from_secs(1),
-        )
-        .await?;
         loop {
-            let wakeup = match manifest.borrow().leader {
-                Leadership::HasLeader { expire_at, .. } => {
-                    (expire_at - Utc::now()).to_std().unwrap_or_default()
-                }
-                _ => Duration::ZERO,
-            };
-            select! {
-                _ = manifest.changed() => {}
-                _ = tokio::time::sleep(wakeup) => {}
-            }
-            let manifest = manifest.borrow();
-            if manifest.leader.has_leader() {
-                continue;
-            } else {
-                debug!(manifest.epoch, "No leader for the cluster");
-                let mut manifest = manifest.clone();
-
-                manifest.epoch += 1;
-                manifest.leader = Leadership::HasLeader {
-                    uuid: node.uuid,
-                    address: node.address,
-                    expire_at: Utc::now() + Duration::from_secs(30),
-                };
-
-                match Manifest::write(&node.object_store, &manifest).await {
+            replica.refresh().await?;
+            if replica.get_leader().await?.is_none() || !replica.was_recently_modified() {
+                // try to acquire leadership
+                match replica.incr_epoch(Some(node.clone())).await {
                     Ok(()) => {
-                        info!(manifest.epoch, "Acquired leadership");
-                        manifest.epoch += 1;
-
-                        let manifest = Arc::new(RwLock::new(manifest));
-                        let mut tasks = JoinSet::new();
-                        // fork a task to keep the leadership alive, this will be cancelled when the node is dropped
-                        tasks.spawn(Self::keep_alive(node.clone(), manifest.clone()));
-                        return Ok(Self {
-                            node,
-                            manifest,
-                            tasks,
-                        });
+                        info!("Acquired leadership");
+                        let cancel = CancellationToken::new();
+                        let keep_alive =
+                            tokio::spawn(Self::keep_alive(node, replica, cancel.child_token()));
+                        let cancel = cancel.drop_guard();
+                        return Ok(Self { keep_alive, cancel });
                     }
                     Err(err) => {
                         debug!(?err, "Failed to acquire leadership");
                     }
                 }
             }
-        }
-    }
-
-    pub async fn shutdown(mut self) {
-        self.tasks.shutdown().await;
-        let mut manifest = Arc::into_inner(self.manifest)
-            .expect("leaked manifest?")
-            .into_inner();
-        manifest.leader = Leadership::NoLeader;
-        if let Err(err) = Manifest::write(&self.node.object_store, &manifest).await {
-            error!(?err, "Failed to release leadership");
-        } else {
-            info!(manifest.epoch, "Released leadership");
-        }
-    }
-
-    async fn keep_alive(node: Node, manifest: Arc<RwLock<Manifest<M>>>) {
-        loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let current_manifest = manifest.read().clone();
-            match Manifest::write(&node.object_store, &current_manifest).await {
-                Ok(()) => {
-                    let epoch = {
-                        let mut manifest = manifest.write();
-                        manifest.epoch += 1;
-                        manifest.leader = Leadership::HasLeader {
-                            uuid: node.uuid,
-                            address: node.address,
-                            expire_at: Utc::now() + Duration::from_secs(30),
-                        };
-                        manifest.epoch
-                    };
+        }
+    }
 
-                    if let Some(old_epoch) = epoch.checked_sub(30) {
-                        if let Err(e) = Manifest::<M>::delete(&node.object_store, old_epoch).await {
-                            error!(?e, "Failed to delete old manifest");
-                        }
+    async fn keep_alive(node: Node, mut replica: Replica, cancel: CancellationToken) -> Replica {
+        while !cancel.is_cancelled() {
+            select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if let Err(err) = replica.incr_epoch(Some(node.clone())).await {
+                        error!(?err, "Failed to sync replica");
+                    } else {
+                        debug!(epoch = replica.epoch(), "Synced successfully");
                     }
                 }
-                Err(err) => {
-                    error!(?err, "Failed to renew leadership");
-                }
+                _ = cancel.cancelled() => break,
             }
         }
+        replica
     }
-}
 
-impl<M> Member for LeaderNode<M>
-where
-    M: ManifestData,
-{
-    type Manifest = M;
-
-    fn manifest(&self) -> Self::Manifest {
-        self.manifest.read().manifest.clone()
-    }
-}
-
-impl<M> Follower for LeaderNode<M> where M: ManifestData {}
-
-impl<M> Leader for LeaderNode<M>
-where
-    M: ManifestData,
-{
-    async fn shutdown(self) -> Result<()> {
-        LeaderNode::shutdown(self).await;
+    pub async fn shutdown(self) -> Result<()> {
+        drop(self.cancel);
+        let mut replica = self.keep_alive.await?;
+        replica.incr_epoch(None).await?;
+        info!("Released leadership");
         Ok(())
+    }
+}
+
+impl Follower for LeaderNode {}
+
+impl Leader for LeaderNode {
+    async fn shutdown(self) -> Result<()> {
+        LeaderNode::shutdown(self).await
     }
 }

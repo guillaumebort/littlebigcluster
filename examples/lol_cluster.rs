@@ -7,11 +7,6 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, Level};
 use tracing_subscriber::fmt;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LolManifest {
-    status: String,
-}
-
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -41,8 +36,6 @@ enum Command {
     Leader,
     /// Join the cluster as a follower
     Follower,
-    /// Join the cluster as a member
-    Member,
 }
 
 #[tokio::main]
@@ -56,6 +49,10 @@ pub async fn main() {
         1 => tracing_subscriber::fmt()
             .with_max_level(Level::DEBUG)
             .event_format(fmt::format())
+            .init(),
+        2 => tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .event_format(fmt::format().pretty())
             .init(),
         _ => tracing_subscriber::fmt()
             .with_max_level(Level::TRACE)
@@ -75,7 +72,6 @@ pub async fn main() {
         Command::Init => init_cluster(&cluster).await,
         Command::Leader => leader(cluster).await,
         Command::Follower => follower(cluster).await,
-        Command::Member => member(cluster).await,
     };
 
     if let Err(err) = command_result {
@@ -84,7 +80,7 @@ pub async fn main() {
     }
 }
 
-async fn leader(cluster: LiteCluster<LolManifest>) -> Result<()> {
+async fn leader(cluster: LiteCluster) -> Result<()> {
     let node = cluster.join_as_leader().await?;
     info!("Joined cluster");
 
@@ -101,28 +97,17 @@ async fn leader(cluster: LiteCluster<LolManifest>) -> Result<()> {
     Ok(())
 }
 
-async fn follower(cluster: LiteCluster<LolManifest>) -> Result<()> {
+async fn follower(cluster: LiteCluster) -> Result<()> {
     let node = cluster.join_as_follower().await?;
     info!("Joined cluster");
 
     Ok(())
 }
 
-async fn member(cluster: LiteCluster<LolManifest>) -> Result<()> {
-    let node = cluster.join_as_member().await?;
-    info!("Joined cluster");
-
-    Ok(())
+fn open_cluster(cluster_id: &str, path: &std::path::Path) -> Result<LiteCluster> {
+    LiteCluster::at(cluster_id, LocalFileSystem::new_with_prefix(path)?)
 }
 
-fn open_cluster(cluster_id: &str, path: &std::path::Path) -> Result<LiteCluster<LolManifest>> {
-    LiteCluster::open(cluster_id, LocalFileSystem::new_with_prefix(path)?)
-}
-
-async fn init_cluster(cluster: &LiteCluster<LolManifest>) -> Result<()> {
-    cluster
-        .init(LolManifest {
-            status: "Cluster was just initialized".to_string(),
-        })
-        .await
+async fn init_cluster(cluster: &LiteCluster) -> Result<()> {
+    cluster.init().await
 }
