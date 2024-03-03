@@ -8,11 +8,11 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    task::Poll, time::Instant,
+    task::Poll,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 use parking_lot::Mutex;
 use pin_project_lite::pin_project;
 use rusqlite::{types::FromSql, Connection, DatabaseName, OpenFlags, Params, Transaction};
@@ -339,36 +339,30 @@ impl DB {
         A: Send + 'static,
     {
         let shadow = NamedTempFile::new_in(self.tmp.path())?;
-        let mut pending_acks = Vec::with_capacity(1_024);
-        // this block prevent concurrent writes, so keep it short
-        {
-            let snapshot = shadow.path().to_owned();
-            let _guard = self.write_pool.block().await?;
-            std::mem::swap(&mut pending_acks, &mut *self.pending_acks.lock());
-            let factory = self.internal_factory.clone();
-            tokio::task::spawn_blocking(move || {
-                let connection = factory()?;
-                let wal_path = wal_path(&connection);
-                std::fs::copy(wal_path, snapshot)?;
-                connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-                anyhow::Ok(())
+        let (result, pending_acks) = {
+            let shadow = shadow.path().to_owned();
+            self.do_checkpoint(|wal| {
+                async move {
+                    tokio::fs::copy(wal, shadow).await?;
+                    Ok(())
+                }
+                .boxed()
             })
-            .await??;
-        }
+            .await?
+        };
+        result?;
         match f(shadow.path().to_owned()).await {
             Ok(a) => {
-                tokio::task::spawn_blocking(move || {
-                    let t = Instant::now();
+                tokio::task::spawn_blocking(|| {
                     for do_ack in pending_acks {
                         let _ = do_ack.send(true);
                     }
-                    dbg!(t.elapsed());
                 })
                 .await?;
                 Ok(a)
             }
             Err(e) => {
-                tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(|| {
                     for do_ack in pending_acks {
                         let _ = do_ack.send(false);
                     }
@@ -379,7 +373,66 @@ impl DB {
         }
     }
 
-    pub(crate) async fn rollback(&self) -> Result<()> {
+    pub(crate) async fn try_checkpoint<A>(
+        &self,
+        f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
+    ) -> Result<A>
+    where
+        A: Send + 'static,
+    {
+        let (result, pending_acks) = self.do_checkpoint(f).await?;
+        match result {
+            Ok(a) => {
+                tokio::task::spawn_blocking(|| {
+                    for do_ack in pending_acks {
+                        let _ = do_ack.send(true);
+                    }
+                })
+                .await?;
+                Ok(a)
+            }
+            Err(e) => {
+                self.rollback().await?;
+                tokio::task::spawn_blocking(|| {
+                    for do_ack in pending_acks {
+                        let _ = do_ack.send(false);
+                    }
+                })
+                .await?;
+                Err(e)
+            }
+        }
+    }
+
+    async fn do_checkpoint<A>(
+        &self,
+        f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
+    ) -> Result<(Result<A>, Vec<DoAck>)>
+    where
+        A: Send + 'static,
+    {
+        // this guard will block all concurrent writes
+        let _guard = self.write_pool.block().await?;
+
+        // let's snapshot the pending acks
+        let mut pending_acks = Vec::with_capacity(1_024);
+        std::mem::swap(&mut pending_acks, &mut *self.pending_acks.lock());
+
+        // run the checkpoint
+        let factory = self.internal_factory.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let connection = factory()?;
+            let wal_path = wal_path(&connection);
+            let result = Handle::current().block_on(f(wal_path))?;
+            connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+            anyhow::Ok(result)
+        })
+        .await?;
+
+        Ok((result, pending_acks))
+    }
+
+    async fn rollback(&self) -> Result<()> {
         let mut pending_acks = Vec::with_capacity(1_024);
         {
             let _write_guard = self.write_pool.block().await?;
@@ -598,6 +651,33 @@ mod tests {
             .readonly_transaction(|txn| txn.execute("create table lol(id);", ()))
             .await
             .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn block_pool() -> Result<()> {
+        let leader = DB::open(None).await?;
+
+        let blocking_permits = leader.write_pool.block().await?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        leader
+            .clone()
+            .write_pool
+            .call(
+                Box::new(|c| Ok(c.query_row("select 1", [], |_| Ok(Box::new(1)))?)),
+                tx,
+                None,
+            )
+            .await?;
+
+        // the pool is blocked, the call will timeout
+        assert!(tokio::time::timeout(Duration::from_millis(100), rx)
+            .await
+            .is_err());
+
+        drop(blocking_permits);
+
         Ok(())
     }
 
@@ -837,7 +917,7 @@ mod tests {
 
         // checkpoint the db
         let wal_snapshot_2 = db
-            .checkpoint(|wal| {
+            .try_checkpoint(|wal| {
                 async {
                     let tmp = NamedTempFile::new()?;
                     std::fs::copy(wal, tmp.path())?;
@@ -850,32 +930,34 @@ mod tests {
 
         assert!(ack_2.await.is_ok());
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn block_pool() -> Result<()> {
-        let leader = DB::open(None).await?;
-
-        let blocking_permits = leader.write_pool.block().await?;
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        leader
-            .clone()
-            .write_pool
-            .call(
-                Box::new(|c| Ok(c.query_row("select 1", [], |_| Ok(Box::new(1)))?)),
-                tx,
-                None,
+        // insert some data
+        let ack_3 = db
+            .execute(
+                "INSERT INTO batchs VALUES (?1)",
+                [("0191b6d0-3d9a-7eb1-88b8-5312737f2ca1")],
             )
             .await?;
 
-        // the pool is blocked, the call will timeout
-        assert!(tokio::time::timeout(Duration::from_millis(100), rx)
-            .await
-            .is_err());
+        // check the db content
+        assert_eq!(
+            2,
+            db.query_scalar::<i32>("select count(*) from batchs", [])
+                .await?,
+        );
 
-        drop(blocking_permits);
+        // failed checkpoint
+        let wal_snapshot_3: Result<()> = db
+            .try_checkpoint(|_| async { Err(anyhow!("oops")) }.boxed())
+            .await;
+        assert!(wal_snapshot_3.is_err());
+        assert!(ack_3.await.is_err());
+
+        // check the db content
+        assert_eq!(
+            1,
+            db.query_scalar::<i32>("select count(*) from batchs", [])
+                .await?,
+        );
 
         Ok(())
     }
@@ -951,11 +1033,32 @@ mod tests {
             async move {
                 let mut i = 0;
                 loop {
-                    if rand::thread_rng().gen_bool(0.2) {
-                        leader.rollback().await.unwrap();
-                        println!("leader: rollbacked current wal",);
+                    let shadow = log.path().join(format!("wal_{}", i));
+                    let out = shadow.display().to_string();
+                    if rand::thread_rng().gen_bool(0.5) {
+                        match leader
+                            .try_checkpoint(move |wal| {
+                                async {
+                                    if rand::thread_rng().gen_bool(0.5) {
+                                        Err(anyhow!("oops"))
+                                    } else {
+                                        std::fs::copy(wal, shadow)?;
+                                        Ok(())
+                                    }
+                                }
+                                .boxed()
+                            })
+                            .await
+                        {
+                            Ok(_) => {
+                                println!("leader: checkpointed {out}");
+                                i += 1;
+                            }
+                            Err(e) => {
+                                println!("leader: checkpoint was rollbacked: {e}");
+                            }
+                        }
                     } else {
-                        let wal = log.path().join(format!("wal_{}", i));
                         match leader
                             .checkpoint(|wal| {
                                 async {
@@ -968,8 +1071,8 @@ mod tests {
                             .await
                         {
                             Ok(tmp) => {
-                                std::fs::rename(tmp.path(), &wal).unwrap();
-                                println!("leader: checkpointed {}", wal.display());
+                                std::fs::rename(tmp.path(), &shadow).unwrap();
+                                println!("leader: checkpointed {out}");
                                 i += 1;
                             }
                             Err(e) => {

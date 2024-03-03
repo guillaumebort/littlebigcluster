@@ -31,6 +31,7 @@ impl Object {
 pub(crate) struct Replica {
     pub object_store: Arc<dyn ObjectStore>,
     last_modified: DateTime<Utc>,
+    snapshot_epoch: u64,
     epoch: u64,
     db: DB,
 }
@@ -63,6 +64,7 @@ impl Replica {
         let mut replica = Replica {
             object_store,
             last_modified,
+            snapshot_epoch,
             epoch: snapshot_epoch,
             db,
         };
@@ -122,8 +124,8 @@ impl Replica {
         self.epoch
     }
 
-    pub fn db(&self) -> &DB {
-        &self.db
+    pub fn owned_db(&self) -> DB {
+        self.db.clone()
     }
 
     pub fn was_recently_modified(&self) -> bool {
@@ -134,11 +136,11 @@ impl Replica {
         self.db
             .query_row_opt(
                 r#"
-                    SELECT
-                        json_extract(value, '$.uuid') AS uuid,
-                        json_extract(value, '$.address') AS address
-                    FROM litecluster
-                    WHERE key = "leader"
+                SELECT
+                    json_extract(value, '$.uuid') AS uuid,
+                    json_extract(value, '$.address') AS address
+                FROM litecluster
+                WHERE key = "leader"
                 "#,
                 [],
                 |row| {
@@ -156,15 +158,45 @@ impl Replica {
             .await
     }
 
-    pub async fn incr_epoch(&mut self, current_leader: Option<Node>) -> Result<()> {
+    pub async fn incr_epoch(&mut self) -> Result<()> {
         let next_epoch = self.epoch + 1;
-        let leader_ack = if let Some(leader) = current_leader {
+        let object_store = self.object_store.clone();
+        match self
+            .db
+            .checkpoint(move |shallow_wal| {
+                async move {
+                    // TODO retry on _some_ failures
+                    Self::put_if_not_exists(
+                        &object_store,
+                        &Self::wal_path(next_epoch),
+                        &shallow_wal,
+                    )
+                    .await
+                }
+                .boxed()
+            })
+            .await
+        {
+            Ok(()) => {
+                self.epoch = next_epoch;
+                Ok(())
+            }
+            Err(e) => {
+                // So we are not leader anymore
+                Err(anyhow!("Failed to increment epoch: {}", e))
+            }
+        }
+    }
+
+    pub async fn try_change_leader(&mut self, new_leader: Option<Node>) -> Result<()> {
+        let next_epoch = self.epoch + 1;
+        let leader_ack = if let Some(leader) = new_leader {
             self.db
                 .execute(
                     r#"
-                INSERT INTO litecluster VALUES("leader", json_object("uuid", ?1, "address", ?2))
-                ON CONFLICT DO UPDATE SET value=json_object("uuid", ?1, "address", ?2);
-            "#,
+                    INSERT INTO litecluster VALUES("leader", json_object("uuid", ?1, "address", ?2))
+                    ON CONFLICT DO UPDATE SET value=json_object("uuid", ?1, "address", ?2);
+                    "#,
                     [leader.uuid.to_string(), leader.address.to_string()],
                 )
                 .await?
@@ -176,7 +208,7 @@ impl Replica {
         let object_store = self.object_store.clone();
         match self
             .db
-            .checkpoint(move |shallow_wal| {
+            .try_checkpoint(move |shallow_wal| {
                 async move {
                     Self::put_if_not_exists(
                         &object_store,
@@ -191,14 +223,12 @@ impl Replica {
         {
             Ok(()) => {
                 self.epoch = next_epoch;
+                // at this point the leader change is supposed to be durable
+                leader_ack.await?;
+                Ok(())
             }
-            Err(e) => {
-                panic!("TODO: Failed to checkpoint: {}", e);
-            }
+            Err(e) => Err(e),
         }
-        // at this point the leader change is supposed to be durable
-        leader_ack.await?;
-        Ok(())
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
@@ -215,7 +245,9 @@ impl Replica {
 
     pub async fn full_refresh(&mut self) -> Result<()> {
         let current_epoch = Self::latest_wal_epoch(&self.object_store).await?;
-        {
+        if current_epoch < self.epoch {
+            bail!("TODO: current_epoch < self.epoch")
+        } else {
             let mut wals = FuturesOrdered::new();
             for i in (self.epoch + 1)..=current_epoch {
                 let wal_path = Self::wal_path(i);
@@ -223,7 +255,7 @@ impl Replica {
             }
             while let Some(wal) = wals.next().await {
                 self.db.apply_wal(wal?.path()).await?;
-                debug!(epoch = self.epoch, "Refreshed replica");
+                debug!("Refreshed replica");
             }
         }
         self.epoch = current_epoch;

@@ -12,6 +12,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
+use crate::db::DB;
 use crate::replica::Replica;
 
 pub trait Follower {
@@ -83,6 +84,7 @@ impl Node {
 
 #[derive(Debug)]
 pub struct LeaderNode {
+    db: DB,
     keep_alive: JoinHandle<Replica>,
     cancel: DropGuard,
 }
@@ -100,14 +102,19 @@ impl LeaderNode {
             replica.refresh().await?;
             if replica.leader().await?.is_none() || !replica.was_recently_modified() {
                 // try to acquire leadership
-                match replica.incr_epoch(Some(node.clone())).await {
+                match replica.try_change_leader(Some(node.clone())).await {
                     Ok(()) => {
                         info!("Acquired leadership");
+                        let db = replica.owned_db();
                         let cancel = CancellationToken::new();
                         let keep_alive =
                             tokio::spawn(Self::keep_alive(node, replica, cancel.child_token()));
                         let cancel = cancel.drop_guard();
-                        return Ok(Self { keep_alive, cancel });
+                        return Ok(Self {
+                            db,
+                            keep_alive,
+                            cancel,
+                        });
                     }
                     Err(err) => {
                         debug!(?err, "Failed to acquire leadership");
@@ -122,8 +129,9 @@ impl LeaderNode {
         while !cancel.is_cancelled() {
             select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if let Err(err) = replica.incr_epoch(Some(node.clone())).await {
-                        error!(?err, "Failed to sync replica");
+                    if let Err(err) = replica.incr_epoch().await {
+                        error!(?err, "TODO");
+                        break;
                     } else {
                         debug!(epoch = replica.epoch(), "Synced successfully");
                     }
@@ -137,7 +145,7 @@ impl LeaderNode {
     pub async fn shutdown(self) -> Result<()> {
         drop(self.cancel);
         let mut replica = self.keep_alive.await?;
-        replica.incr_epoch(None).await?;
+        replica.try_change_leader(None).await?;
         info!("Released leadership");
         Ok(())
     }
