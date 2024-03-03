@@ -6,15 +6,17 @@ use std::{
     future::Future,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
-    time::{Duration, Instant},
+    task::Poll, time::Instant,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::{future::BoxFuture, FutureExt};
+use futures::future::BoxFuture;
 use parking_lot::Mutex;
+use pin_project_lite::pin_project;
 use rusqlite::{types::FromSql, Connection, DatabaseName, OpenFlags, Params, Transaction};
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 use tokio::{runtime::Handle, sync::oneshot, sync::SemaphorePermit};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::debug;
@@ -23,6 +25,29 @@ type DoAck = oneshot::Sender<bool>;
 type Factory = Arc<dyn Fn() -> Result<Connection> + Send + Sync>;
 type Thunk = Box<dyn FnOnce(&mut Connection) -> Result<Box<dyn Any + Send>> + Send>;
 type Callback = tokio::sync::oneshot::Sender<Result<Box<dyn Any + Send>>>;
+
+pin_project! {
+    #[must_use = "Acks must be awaited, or explicitly dropped if you don't care about the result"]
+    pub struct Ack<A> {
+        result: Option<A>,
+        #[pin]
+        ack: oneshot::Receiver<bool>,
+    }
+}
+
+impl<A> Future for Ack<A> {
+    type Output = Result<A>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.ack.poll(cx) {
+            Poll::Ready(Ok(true)) => Poll::Ready(Ok(this.result.take().unwrap())),
+            Poll::Ready(Ok(false)) => Poll::Ready(Err(anyhow!("checkpoint failed"))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DB {
@@ -155,7 +180,8 @@ impl DB {
         &self,
         sql: impl Into<Cow<'static, str>>,
         params: impl Params + Send + 'static,
-    ) -> Result<impl Future<Output = Result<usize>>> { // TODO: box the Acks
+    ) -> Result<Ack<usize>> {
+        // TODO: box the Acks
         let (do_ack, ack) = oneshot::channel();
         let sql = sql.into();
         let result = Self::call(
@@ -164,16 +190,13 @@ impl DB {
             Some(do_ack),
         )
         .await?;
-        Ok(ack.map(move |r| match r {
-            Ok(true) => Ok(result),
-            _ => Err(anyhow!("checkpoint failed")),
-        }))
+        Ok(Ack {
+            result: Some(result),
+            ack,
+        })
     }
 
-    pub async fn execute_batch(
-        &self,
-        sql: impl Into<Cow<'static, str>>,
-    ) -> Result<impl Future<Output = Result<()>>> {
+    pub async fn execute_batch(&self, sql: impl Into<Cow<'static, str>>) -> Result<Ack<()>> {
         let (do_ack, ack) = oneshot::channel();
         let sql = sql.into();
         Self::call(
@@ -182,16 +205,16 @@ impl DB {
             Some(do_ack),
         )
         .await?;
-        Ok(ack.map(|r| match r {
-            Ok(true) => Ok(()),
-            _ => Err(anyhow!("checkpoint failed")),
-        }))
+        Ok(Ack {
+            result: Some(()),
+            ack,
+        })
     }
 
     pub async fn transaction<A>(
         &self,
         thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
-    ) -> Result<impl Future<Output = Result<A>>>
+    ) -> Result<Ack<A>>
     where
         A: Send + 'static,
     {
@@ -202,10 +225,10 @@ impl DB {
             Some(do_ack),
         )
         .await?;
-        Ok(ack.map(move |r| match r {
-            Ok(true) => Ok(result),
-            _ => Err(anyhow!("checkpoint failed")),
-        }))
+        Ok(Ack {
+            result: Some(result),
+            ack,
+        })
     }
 
     pub async fn query_row<A>(
@@ -315,42 +338,71 @@ impl DB {
     where
         A: Send + 'static,
     {
-        let _guard = self.write_pool.block().await?;
-        let factory = self.internal_factory.clone();
-        let pending_acks = self.pending_acks.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let connection = factory()?;
-            let wal_path = wal_path(&connection);
-            let result = Handle::current().block_on(f(wal_path))?;
-            connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-            // TODO: This look too slow
-            for do_ack in pending_acks.lock().drain(..) {
-                let _ = do_ack.send(true);
+        let shadow = NamedTempFile::new_in(self.tmp.path())?;
+        let mut pending_acks = Vec::with_capacity(1_024);
+        // this block prevent concurrent writes, so keep it short
+        {
+            let snapshot = shadow.path().to_owned();
+            let _guard = self.write_pool.block().await?;
+            std::mem::swap(&mut pending_acks, &mut *self.pending_acks.lock());
+            let factory = self.internal_factory.clone();
+            tokio::task::spawn_blocking(move || {
+                let connection = factory()?;
+                let wal_path = wal_path(&connection);
+                std::fs::copy(wal_path, snapshot)?;
+                connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+                anyhow::Ok(())
+            })
+            .await??;
+        }
+        match f(shadow.path().to_owned()).await {
+            Ok(a) => {
+                tokio::task::spawn_blocking(move || {
+                    let t = Instant::now();
+                    for do_ack in pending_acks {
+                        let _ = do_ack.send(true);
+                    }
+                    dbg!(t.elapsed());
+                })
+                .await?;
+                Ok(a)
             }
-            anyhow::Ok(result)
-        })
-        .await?;
-        result
+            Err(e) => {
+                tokio::task::spawn_blocking(move || {
+                    for do_ack in pending_acks {
+                        let _ = do_ack.send(false);
+                    }
+                })
+                .await?;
+                Err(e)
+            }
+        }
     }
 
     pub(crate) async fn rollback(&self) -> Result<()> {
-        let _write_guard = self.write_pool.block().await?;
-        let _read_guard = self.read_pool.block().await?;
-        let factory = self.internal_factory.clone();
-        let pending_acks = self.pending_acks.clone();
+        let mut pending_acks = Vec::with_capacity(1_024);
+        {
+            let _write_guard = self.write_pool.block().await?;
+            let _read_guard = self.read_pool.block().await?;
+            std::mem::swap(&mut pending_acks, &mut *self.pending_acks.lock());
+            let factory = self.internal_factory.clone();
+            tokio::task::spawn_blocking(move || {
+                let connection = factory()?;
+                let wal_path = wal_path(&connection);
+                std::fs::File::create(wal_path)?; // truncate wal file
+                Self::invalidate_shm(&connection)?;
+                // truncate properly
+                connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+                anyhow::Ok(())
+            })
+            .await??;
+        }
         tokio::task::spawn_blocking(move || {
-            let connection = factory()?;
-            let wal_path = wal_path(&connection);
-            std::fs::File::create(wal_path)?; // truncate wal file
-            Self::invalidate_shm(&connection)?;
-            // truncate properly
-            connection.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-            for do_ack in pending_acks.lock().drain(..) {
+            for do_ack in pending_acks {
                 let _ = do_ack.send(false);
             }
-            anyhow::Ok(())
         })
-        .await??;
+        .await?;
         Ok(())
     }
 

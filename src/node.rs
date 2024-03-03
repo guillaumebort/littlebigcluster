@@ -98,7 +98,7 @@ impl LeaderNode {
         info!("Waiting for leadership...");
         loop {
             replica.refresh().await?;
-            if replica.get_leader().await?.is_none() || !replica.was_recently_modified() {
+            if replica.leader().await?.is_none() || !replica.was_recently_modified() {
                 // try to acquire leadership
                 match replica.incr_epoch(Some(node.clone())).await {
                     Ok(()) => {

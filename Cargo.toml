@@ -23,6 +23,7 @@ futures = "0.3.17"
 tracing = "0.1"
 parking_lot = "0.12.1"
 bytes = "1.1.0"
+pin-project-lite = "0.2.14"
 
 [dev-dependencies]
 rand = "0.8.5"

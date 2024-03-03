@@ -130,7 +130,7 @@ impl Replica {
         self.last_modified > Utc::now() - chrono::Duration::seconds(10)
     }
 
-    pub async fn get_leader(&self) -> Result<Option<Node>> {
+    pub async fn leader(&self) -> Result<Option<Node>> {
         self.db
             .query_row_opt(
                 r#"
@@ -168,12 +168,10 @@ impl Replica {
                     [leader.uuid.to_string(), leader.address.to_string()],
                 )
                 .await?
-                .boxed()
         } else {
             self.db
                 .execute(r#"DELETE FROM litecluster WHERE key = "leader""#, [])
                 .await?
-                .boxed()
         };
         let object_store = self.object_store.clone();
         match self
