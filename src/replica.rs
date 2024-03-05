@@ -3,14 +3,20 @@ use std::{sync::Arc, time::Instant};
 use anyhow::{anyhow, bail, Result};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
-use futures::{stream::FuturesOrdered, FutureExt, StreamExt};
+use futures::{
+    stream::{FuturesOrdered, FuturesUnordered},
+    FutureExt, StreamExt, TryStreamExt,
+};
 use object_store::{path::Path, ObjectStore, PutMode, PutOptions};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, info};
+use tracing::{debug, error, trace};
 use uuid::Uuid;
 
 use crate::{db::DB, Node};
+
+const SNAPSHOT_INTERVAL: u64 = 30;
+const KEEP_SNAPSHOTS: u64 = 10;
 
 struct Object {
     tmp: NamedTempFile,
@@ -41,16 +47,18 @@ impl Replica {
     pub const WAL_PATH: &'static str = "/wal";
 
     pub async fn open(cluster_id: &str, object_store: Arc<dyn ObjectStore>) -> Result<Self> {
-        // Restore latest snapshot
+        // Find latest snapshot
         let snapshot_epoch = Self::latest_snapshot_epoch(&object_store).await?;
-        debug!(snapshot_epoch, "Restoring snapshot");
+        debug!(snapshot_epoch, ?object_store, "Restoring snapshot");
         let snapshot = Self::get(&object_store, Self::snapshot_path(snapshot_epoch)).await?;
         let last_modified = snapshot.last_modified();
+
+        // Create a DB from the snapshot
         let db = DB::open(Some(snapshot.path())).await?;
 
         // verify cluster ID
         let db_cluster_id = db
-            .query_scalar::<String>(r#"SELECT value FROM litecluster WHERE key = "cluster_id""#, [])
+            .query_scalar::<String>(r#"SELECT value FROM _lbc WHERE key = 'cluster_id'"#, [])
             .await?;
         if db_cluster_id != cluster_id {
             bail!(
@@ -68,22 +76,29 @@ impl Replica {
             epoch: snapshot_epoch,
             db,
         };
-        let t = Instant::now();
-        replica.full_refresh().await?;
-        info!(
-            replica.epoch,
-            snapshot_epoch,
-            "Opened replica in {:?}",
-            t.elapsed()
-        );
+
+        // Do a full refresh (find latest WALs and apply them)
+        {
+            let t = Instant::now();
+            replica.full_refresh().await?;
+            debug!(
+                replica.epoch,
+                snapshot_epoch,
+                "Opened replica in {:?}",
+                t.elapsed()
+            );
+        }
 
         Ok(replica)
     }
 
     pub async fn init(cluster_id: String, object_store: Arc<dyn ObjectStore>) -> Result<()> {
+        // Create a new (fresh) DB
         let db = DB::open(None).await?;
         {
             let object_store = object_store.clone();
+
+            // Verify that there is no file in the WAL path already
             if let Some(object) = object_store
                 .list(Some(&Path::from(Self::WAL_PATH)))
                 .next()
@@ -91,16 +106,20 @@ impl Replica {
             {
                 bail!("Cluster already initialized? found: {}", object?.location);
             }
+
+            // Initialize the system table
             let ack = db
                 .transaction(|txn| {
                     txn.execute_batch(r#"CREATE TABLE litecluster (key TEXT PRIMARY KEY, value ANY)"#)?;
                     txn.execute(
-                        r#"INSERT INTO litecluster VALUES ("cluster_id", ?1);"#,
+                        r#"INSERT INTO _lbc VALUES ('cluster_id', ?1);"#,
                         [cluster_id],
                     )?;
                     txn.commit()
                 })
                 .await?;
+
+            // Do a first checkpoint for epoch 0 and push the WAL to the object store
             db.checkpoint(|wal_path| {
                 async move {
                     let wal_snapshot_path = Self::wal_path(0);
@@ -111,12 +130,15 @@ impl Replica {
             .await?;
             ack.await?;
         }
+
+        // Create the initial snapshot for epoch 0
         {
             let snapshost_0 = NamedTempFile::new()?;
             db.snapshot(snapshost_0.path()).await?;
             Self::put_if_not_exists(&object_store, &Self::snapshot_path(0), snapshost_0.path())
                 .await?;
         }
+
         Ok(())
     }
 
@@ -128,28 +150,33 @@ impl Replica {
         self.db.clone()
     }
 
-    pub fn was_recently_modified(&self) -> bool {
-        self.last_modified > Utc::now() - chrono::Duration::seconds(10)
+    pub fn last_update(&self) -> DateTime<Utc> {
+        self.last_modified
     }
 
+    /// Retrieve the leader for the replica current epoch
     pub async fn leader(&self) -> Result<Option<Node>> {
         self.db
             .query_row_opt(
                 r#"
-                SELECT
-                    json_extract(value, '$.uuid') AS uuid,
-                    json_extract(value, '$.address') AS address
-                FROM litecluster
-                WHERE key = "leader"
+                SELECT * FROM
+                    (SELECT
+                        json_extract(value, '$.uuid') AS uuid,
+                        json_extract(value, '$.address') AS address
+                    FROM _lbc
+                    WHERE key = 'leader')
+                    JOIN
+                    (SELECT value AS cluster_id FROM _lbc WHERE key = 'cluster_id')
                 "#,
                 [],
                 |row| {
                     let uuid: String = row.get("uuid")?;
                     let address: String = row.get("address")?;
+                    let cluster_id: String = row.get("cluster_id")?;
                     let uuid = Uuid::parse_str(&uuid)?;
                     let address = address.parse()?;
                     Ok(Node {
-                        cluster_id: "TODO".to_string(),
+                        cluster_id,
                         uuid,
                         address,
                     })
@@ -158,14 +185,23 @@ impl Replica {
             .await
     }
 
+    /// Try to increment the epoch and create a new WAL
+    /// This is an atomic operation that only the current leader is allowed to do
+    /// If there is a conflict it means that the current node is not the leader anymore
     pub async fn incr_epoch(&mut self) -> Result<()> {
         let next_epoch = self.epoch + 1;
         let object_store = self.object_store.clone();
+
+        // Snapshot if needed
+        if next_epoch - self.snapshot_epoch >= SNAPSHOT_INTERVAL {
+            self.snapshot().await?;
+        }
+
         match self
             .db
             .checkpoint(move |shallow_wal| {
                 async move {
-                    // TODO retry on _some_ failures
+                    // TODO retry on _some_ failures (but not on conflict)
                     Self::put_if_not_exists(
                         &object_store,
                         &Self::wal_path(next_epoch),
@@ -188,26 +224,66 @@ impl Replica {
         }
     }
 
+    /// Do a snapshot of the current state of the DB and push it to the object store
+    async fn snapshot(&mut self) -> Result<()> {
+        // First create a local snapshot
+        let snapshot = NamedTempFile::new()?;
+        self.db.snapshot(snapshot.path()).await?;
+
+        // The snaphshot is for the current epoch
+        let snapshot_epoch = self.epoch;
+        debug!(snapshot_epoch, "Created snapshot");
+        self.snapshot_epoch = snapshot_epoch;
+
+        // We are going to upload the snapshot in the background to avoid blocking the leader
+        let object_store = self.object_store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Self::put_if_not_exists(
+                &object_store,
+                &Self::snapshot_path(snapshot_epoch),
+                snapshot.path(),
+            )
+            .await
+            {
+                error!(?e, "Failed to upload snapshot for epoch {}", snapshot_epoch);
+            } else {
+                debug!(snapshot_epoch, "Snapshot uploaded");
+                // So it's maybe time to GC
+                if let Err(e) = Self::gc(&object_store).await {
+                    error!(?e, "Failed to GC after snapshot");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Attempt to change the leader for the next epoch
     pub async fn try_change_leader(&mut self, new_leader: Option<Node>) -> Result<()> {
         let next_epoch = self.epoch + 1;
+
+        // mark us as leader in the DB
         let leader_ack = if let Some(leader) = new_leader {
             self.db
                 .execute(
                     r#"
-                    INSERT INTO litecluster VALUES("leader", json_object("uuid", ?1, "address", ?2))
-                    ON CONFLICT DO UPDATE SET value=json_object("uuid", ?1, "address", ?2);
+                    INSERT INTO _lbc VALUES('leader', json_object('uuid', ?1, 'address', ?2))
+                    ON CONFLICT DO UPDATE SET value=json_object('uuid', ?1, 'address', ?2);
                     "#,
                     [leader.uuid.to_string(), leader.address.to_string()],
                 )
                 .await?
         } else {
             self.db
-                .execute(r#"DELETE FROM litecluster WHERE key = "leader""#, [])
+                .execute(r#"DELETE FROM _lbc WHERE key = 'leader'"#, [])
                 .await?
         };
+
+        // Try to checkpoint for the next epoch
         let object_store = self.object_store.clone();
         match self
             .db
+            // If it fails the change in the DB will be rolled back so we can keep applying WALs received by the new leader without starting from scratch
             .try_checkpoint(move |shallow_wal| {
                 async move {
                     Self::put_if_not_exists(
@@ -231,6 +307,8 @@ impl Replica {
         }
     }
 
+    /// Attempt to refresh the replica by applying the next WAL
+    /// Lookup for the next epoch WAL and apply it if it exists
     pub async fn refresh(&mut self) -> Result<()> {
         while let Some(wal) =
             Self::get_if_exists(&self.object_store, Self::wal_path(self.epoch + 1)).await?
@@ -238,7 +316,7 @@ impl Replica {
             self.db.apply_wal(wal.path()).await?;
             self.last_modified = wal.last_modified();
             self.epoch += 1;
-            debug!(epoch = self.epoch, "Refreshed replica");
+            trace!(epoch = self.epoch, "Refreshed replica");
         }
         Ok(())
     }
@@ -249,17 +327,84 @@ impl Replica {
             bail!("TODO: current_epoch < self.epoch")
         } else {
             let mut wals = FuturesOrdered::new();
-            for i in (self.epoch + 1)..=current_epoch {
-                let wal_path = Self::wal_path(i);
-                wals.push_back(Self::get(&self.object_store, wal_path));
+            for epoch in (self.epoch + 1)..=current_epoch {
+                let wal_path = Self::wal_path(epoch);
+                wals.push_back(Self::get(&self.object_store, wal_path).map(move |o| (epoch, o)));
             }
-            while let Some(wal) = wals.next().await {
-                self.db.apply_wal(wal?.path()).await?;
-                debug!("Refreshed replica");
+            while let Some((epoch, wal)) = wals.next().await {
+                let wal = wal?;
+                self.db.apply_wal(wal.path()).await?;
+                self.last_modified = wal.last_modified();
+                trace!(epoch, "Refreshed replica");
             }
         }
         self.epoch = current_epoch;
         self.refresh().await
+    }
+
+    pub async fn gc(object_store: &impl ObjectStore) -> Result<()> {
+        // keep N latest snapshots
+        let mut snapshots = object_store.list(Some(&Path::from(Self::SNAPSHOT_PATH)));
+        let mut snaphost_epochs = Vec::with_capacity(snapshots.size_hint().0);
+        while let Some(snapshot) = snapshots.next().await.transpose()? {
+            if let Some(epoch) = snapshot
+                .location
+                .filename()
+                .and_then(|filename| filename.strip_suffix(".db"))
+                .and_then(|filename| filename.parse::<u64>().ok())
+            {
+                snaphost_epochs.push(epoch);
+            }
+        }
+
+        if snaphost_epochs.is_empty() {
+            bail!("No snapshots found");
+        }
+
+        snaphost_epochs.sort_unstable();
+        snaphost_epochs.reverse();
+        let (keep, delete) = snaphost_epochs.split_at(KEEP_SNAPSHOTS.try_into()?);
+        debug!(?keep, ?delete, "Found {} snapshots", snaphost_epochs.len());
+
+        let delete_futures = FuturesUnordered::new();
+        for epoch in delete {
+            let path = Self::snapshot_path(*epoch);
+            delete_futures.push(async move {
+                trace!(?path, "Deleting old SNAPSHOT");
+                object_store.delete(&path).await?;
+                anyhow::Ok(())
+            });
+        }
+        if let Err(e) = delete_futures.try_collect::<Vec<_>>().await {
+            error!(?e, "Failed to delete all snapshots");
+        }
+        let latest_snapshot_epoch = keep[0];
+
+        // now delete all WALs that are older than the latest snapshot
+        let delete_futures = FuturesUnordered::new();
+        let mut wals = object_store.list(Some(&Path::from(Self::WAL_PATH)));
+        while let Some(wal) = wals.next().await.transpose()? {
+            if let Some(epoch) = wal
+                .location
+                .filename()
+                .and_then(|filename| filename.strip_suffix(".wal"))
+                .and_then(|filename| filename.parse::<u64>().ok())
+            {
+                if epoch < latest_snapshot_epoch {
+                    let path = wal.location;
+                    trace!(?path, "Deleting old WAL");
+                    delete_futures.push(async move {
+                        object_store.delete(&path).await?;
+                        anyhow::Ok(())
+                    });
+                }
+            }
+        }
+        if let Err(e) = delete_futures.try_collect::<Vec<_>>().await {
+            error!(?e, "Failed to delete all WALs");
+        }
+
+        Ok(())
     }
 
     async fn get(object_store: &impl ObjectStore, path: Path) -> Result<Object> {
@@ -332,9 +477,9 @@ impl Replica {
         path: &Path,
         suffix: &str,
     ) -> Result<u64> {
-        let mut manifests = object_store.list(Some(&path));
+        let mut items = object_store.list(Some(&path));
         let mut current_epoch: Option<u64> = None;
-        while let Some(manifest) = match manifests.next().await.transpose() {
+        while let Some(manifest) = match items.next().await.transpose() {
             Ok(file) => file,
             Err(e) => bail!("Failed to list objects: {}", e),
         } {

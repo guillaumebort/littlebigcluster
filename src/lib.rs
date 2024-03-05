@@ -4,12 +4,11 @@ mod replica;
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use node::LeaderNode;
+use anyhow::Result;
 pub use node::{Follower, Leader, Node};
+use node::{FollowerNode, LeaderNode};
 use object_store::ObjectStore;
 use replica::Replica;
-use tracing::debug;
 
 pub struct LiteCluster {
     cluster_id: String,
@@ -37,7 +36,7 @@ impl LiteCluster {
 
     pub async fn join_as_follower(self) -> Result<impl Follower> {
         let node = Node::new(self.cluster_id);
-        LeaderNode::join(node, self.object_store).await // FIXME
+        FollowerNode::join(node, self.object_store).await
     }
 
     pub async fn init(&self) -> Result<()> {

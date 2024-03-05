@@ -14,7 +14,6 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use futures::{future::BoxFuture, FutureExt};
 use parking_lot::Mutex;
-use pin_project_lite::pin_project;
 use rusqlite::{types::FromSql, Connection, DatabaseName, OpenFlags, Params, Transaction};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{runtime::Handle, sync::oneshot, sync::SemaphorePermit};
@@ -26,22 +25,24 @@ type Factory = Arc<dyn Fn() -> Result<Connection> + Send + Sync>;
 type Thunk = Box<dyn FnOnce(&mut Connection) -> Result<Box<dyn Any + Send>> + Send>;
 type Callback = tokio::sync::oneshot::Sender<Result<Box<dyn Any + Send>>>;
 
-pin_project! {
-    #[must_use = "Acks must be awaited, or explicitly dropped if you don't care about the result"]
-    pub struct Ack<A> {
-        result: Option<A>,
-        #[pin]
-        ack: oneshot::Receiver<bool>,
-    }
+#[must_use = "Acks must be awaited, or explicitly dropped if you don't care about the result"]
+pub struct Ack<A>
+where
+    A: Unpin,
+{
+    result: Option<A>,
+    ack: oneshot::Receiver<bool>,
 }
 
-impl<A> Future for Ack<A> {
+impl<A> Future for Ack<A>
+where
+    A: Unpin,
+{
     type Output = Result<A>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        match this.ack.poll(cx) {
-            Poll::Ready(Ok(true)) => Poll::Ready(Ok(this.result.take().unwrap())),
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        match self.ack.poll_unpin(cx) {
+            Poll::Ready(Ok(true)) => Poll::Ready(Ok(self.result.take().unwrap())),
             Poll::Ready(Ok(false)) => Poll::Ready(Err(anyhow!("checkpoint failed"))),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
             Poll::Pending => Poll::Pending,
@@ -216,7 +217,7 @@ impl DB {
         thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
     ) -> Result<Ack<A>>
     where
-        A: Send + 'static,
+        A: Unpin + Send + 'static,
     {
         let (do_ack, ack) = oneshot::channel();
         let result = Self::call(
