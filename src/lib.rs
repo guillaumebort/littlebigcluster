@@ -1,14 +1,17 @@
 mod db;
 mod node;
 mod replica;
+mod server;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
+use axum::Router;
 pub use node::{Follower, Leader, Node};
 use node::{FollowerNode, LeaderNode};
 use object_store::ObjectStore;
 use replica::Replica;
+pub use server::LeaderState;
 
 pub struct LiteCluster {
     cluster_id: String,
@@ -29,13 +32,18 @@ impl LiteCluster {
         &self.cluster_id
     }
 
-    pub async fn join_as_leader(self) -> Result<impl Leader> {
-        let node = Node::new(self.cluster_id);
-        LeaderNode::join(node, self.object_store).await
+    pub async fn join_as_leader(
+        self,
+        az: String,
+        address: SocketAddr,
+        router: Router<LeaderState>,
+    ) -> Result<impl Leader> {
+        let node = Node::new(self.cluster_id, az, Some(address));
+        LeaderNode::join(node, router, self.object_store).await
     }
 
-    pub async fn join_as_follower(self) -> Result<impl Follower> {
-        let node = Node::new(self.cluster_id);
+    pub async fn join_as_follower(self, az: String) -> Result<impl Follower> {
+        let node = Node::new(self.cluster_id, az, None);
         FollowerNode::join(node, self.object_store).await
     }
 

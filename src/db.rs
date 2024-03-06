@@ -5,6 +5,7 @@ use std::{
     fs::File,
     future::Future,
     io::{Read, Seek, Write},
+    ops::Deref,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -175,132 +176,6 @@ impl DB {
             write_pool,
             pending_acks,
         })
-    }
-
-    pub async fn execute(
-        &self,
-        sql: impl Into<Cow<'static, str>>,
-        params: impl Params + Send + 'static,
-    ) -> Result<Ack<usize>> {
-        // TODO: box the Acks
-        let (do_ack, ack) = oneshot::channel();
-        let sql = sql.into();
-        let result = Self::call(
-            &self.write_pool,
-            move |c| Ok(c.execute(sql.as_ref(), params)?),
-            Some(do_ack),
-        )
-        .await?;
-        Ok(Ack {
-            result: Some(result),
-            ack,
-        })
-    }
-
-    pub async fn execute_batch(&self, sql: impl Into<Cow<'static, str>>) -> Result<Ack<()>> {
-        let (do_ack, ack) = oneshot::channel();
-        let sql = sql.into();
-        Self::call(
-            &self.write_pool,
-            move |c| Ok(c.execute_batch(sql.as_ref())?),
-            Some(do_ack),
-        )
-        .await?;
-        Ok(Ack {
-            result: Some(()),
-            ack,
-        })
-    }
-
-    pub async fn transaction<A>(
-        &self,
-        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
-    ) -> Result<Ack<A>>
-    where
-        A: Unpin + Send + 'static,
-    {
-        let (do_ack, ack) = oneshot::channel();
-        let result = Self::call(
-            &self.write_pool,
-            move |c| Ok(thunk(c.transaction()?)?),
-            Some(do_ack),
-        )
-        .await?;
-        Ok(Ack {
-            result: Some(result),
-            ack,
-        })
-    }
-
-    pub async fn query_row<A>(
-        &self,
-        sql: impl Into<Cow<'static, str>>,
-        params: impl Params + Send + 'static,
-        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
-    ) -> Result<A>
-    where
-        A: Send + 'static,
-    {
-        let sql = sql.into();
-        Self::call(
-            &self.read_pool,
-            move |c| c.query_row_and_then(sql.as_ref(), params, |row| f(row)),
-            None,
-        )
-        .await
-    }
-
-    pub async fn query_row_opt<A>(
-        &self,
-        sql: impl Into<Cow<'static, str>>,
-        params: impl Params + Send + 'static,
-        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
-    ) -> Result<Option<A>>
-    where
-        A: Send + 'static,
-    {
-        let sql = sql.into();
-        Self::call(
-            &self.read_pool,
-            move |c| {
-                let mut stmt = c.prepare(&sql)?;
-                let mut rows = stmt.query(params)?;
-                if let Some(row) = rows.next()? {
-                    f(row).map(Some)
-                } else {
-                    Ok(None)
-                }
-            },
-            None,
-        )
-        .await
-    }
-
-    pub async fn query_scalar<A>(
-        &self,
-        sql: impl Into<Cow<'static, str>>,
-        params: impl Params + Send + 'static,
-    ) -> Result<A>
-    where
-        A: FromSql + Send + 'static,
-    {
-        let sql = sql.into();
-        Self::call(
-            &self.read_pool,
-            move |c| Ok(c.query_row(sql.as_ref(), params, |row| row.get(0))?),
-            None,
-        )
-        .await
-    }
-
-    pub async fn readonly_transaction<A>(
-        &self,
-        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
-    ) -> Result<A>
-    where
-        A: Send + 'static,
-    {
-        Self::call(&self.read_pool, move |c| Ok(thunk(c.transaction()?)?), None).await
     }
 
     async fn call<A>(
@@ -603,6 +478,268 @@ impl Pool {
                 .context("failed to send call result")?;
         }
         Ok(())
+    }
+}
+
+pub trait ReadDB {
+    fn query_row<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+        params: impl Params + Send + 'static,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
+    ) -> impl Future<Output = Result<A>> + Send
+    where
+        A: Send + 'static;
+
+    fn query_row_opt<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+        params: impl Params + Send + 'static,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
+    ) -> impl Future<Output = Result<Option<A>>> + Send
+    where
+        A: Send + 'static;
+
+    fn query_scalar<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+        params: impl Params + Send + 'static,
+    ) -> impl Future<Output = Result<A>> + Send
+    where
+        A: FromSql + Send + 'static;
+
+    fn readonly_transaction<A>(
+        &self,
+        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
+    ) -> impl Future<Output = Result<A>> + Send
+    where
+        A: Send + 'static;
+}
+
+impl ReadDB for DB {
+    async fn query_row<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>>,
+        params: impl Params + Send + 'static,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
+    ) -> Result<A>
+    where
+        A: Send + 'static,
+    {
+        let sql = sql.into();
+        Self::call(
+            &self.read_pool,
+            move |c| c.query_row_and_then(sql.as_ref(), params, |row| f(row)),
+            None,
+        )
+        .await
+    }
+
+    async fn query_row_opt<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>>,
+        params: impl Params + Send + 'static,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
+    ) -> Result<Option<A>>
+    where
+        A: Send + 'static,
+    {
+        let sql = sql.into();
+        Self::call(
+            &self.read_pool,
+            move |c| {
+                let mut stmt = c.prepare(&sql)?;
+                let mut rows = stmt.query(params)?;
+                if let Some(row) = rows.next()? {
+                    f(row).map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            None,
+        )
+        .await
+    }
+
+    async fn query_scalar<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>>,
+        params: impl Params + Send + 'static,
+    ) -> Result<A>
+    where
+        A: FromSql + Send + 'static,
+    {
+        let sql = sql.into();
+        Self::call(
+            &self.read_pool,
+            move |c| Ok(c.query_row(sql.as_ref(), params, |row| row.get(0))?),
+            None,
+        )
+        .await
+    }
+
+    async fn readonly_transaction<A>(
+        &self,
+        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
+    ) -> Result<A>
+    where
+        A: Send + 'static,
+    {
+        Self::call(&self.read_pool, move |c| Ok(thunk(c.transaction()?)?), None).await
+    }
+}
+
+impl<X> ReadDB for X
+where
+    X: Deref<Target = DB> + Send + Sync,
+{
+    async fn query_row<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+        params: impl Params + Send + 'static,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
+    ) -> Result<A>
+    where
+        A: Send + 'static,
+    {
+        self.deref().query_row(sql, params, f).await
+    }
+
+    async fn query_row_opt<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+        params: impl Params + Send + 'static,
+        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
+    ) -> Result<Option<A>>
+    where
+        A: Send + 'static,
+    {
+        self.deref().query_row_opt(sql, params, f).await
+    }
+
+    async fn query_scalar<A>(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+        params: impl Params + Send + 'static,
+    ) -> Result<A>
+    where
+        A: FromSql + Send + 'static,
+    {
+        self.deref().query_scalar(sql, params).await
+    }
+
+    async fn readonly_transaction<A>(
+        &self,
+        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
+    ) -> Result<A>
+    where
+        A: Send + 'static,
+    {
+        self.deref().readonly_transaction(thunk).await
+    }
+}
+
+pub trait WriteDB {
+    fn execute(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+        params: impl Params + Send + 'static,
+    ) -> impl Future<Output = Result<Ack<usize>>> + Send;
+
+    fn execute_batch(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+    ) -> impl Future<Output = Result<Ack<()>>> + Send;
+
+    fn transaction<A>(
+        &self,
+        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
+    ) -> impl Future<Output = Result<Ack<A>>> + Send
+    where
+        A: Send + Unpin + 'static;
+}
+
+impl WriteDB for DB {
+    async fn execute(
+        &self,
+        sql: impl Into<Cow<'static, str>>,
+        params: impl Params + Send + 'static,
+    ) -> Result<Ack<usize>> {
+        // TODO: box the Acks
+        let (do_ack, ack) = oneshot::channel();
+        let sql = sql.into();
+        let result = Self::call(
+            &self.write_pool,
+            move |c| Ok(c.execute(sql.as_ref(), params)?),
+            Some(do_ack),
+        )
+        .await?;
+        Ok(Ack {
+            result: Some(result),
+            ack,
+        })
+    }
+
+    async fn execute_batch(&self, sql: impl Into<Cow<'static, str>>) -> Result<Ack<()>> {
+        let (do_ack, ack) = oneshot::channel();
+        let sql = sql.into();
+        Self::call(
+            &self.write_pool,
+            move |c| Ok(c.execute_batch(sql.as_ref())?),
+            Some(do_ack),
+        )
+        .await?;
+        Ok(Ack {
+            result: Some(()),
+            ack,
+        })
+    }
+
+    async fn transaction<A>(
+        &self,
+        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
+    ) -> Result<Ack<A>>
+    where
+        A: Unpin + Send + 'static,
+    {
+        let (do_ack, ack) = oneshot::channel();
+        let result = Self::call(
+            &self.write_pool,
+            move |c| Ok(thunk(c.transaction()?)?),
+            Some(do_ack),
+        )
+        .await?;
+        Ok(Ack {
+            result: Some(result),
+            ack,
+        })
+    }
+}
+
+impl<X> WriteDB for X
+where
+    X: Deref<Target = DB> + Send + Sync,
+{
+    async fn execute(
+        &self,
+        sql: impl Into<Cow<'static, str>> + Send,
+        params: impl Params + Send + 'static,
+    ) -> Result<Ack<usize>> {
+        self.deref().execute(sql, params).await
+    }
+
+    async fn execute_batch(&self, sql: impl Into<Cow<'static, str>> + Send) -> Result<Ack<()>> {
+        self.deref().execute_batch(sql).await
+    }
+
+    async fn transaction<A>(
+        &self,
+        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
+    ) -> Result<Ack<A>>
+    where
+        A: Unpin + Send + 'static,
+    {
+        self.deref().transaction(thunk).await
     }
 }
 
@@ -1120,7 +1257,7 @@ mod tests {
         });
 
         write_loop.await?;
-        let total_seen_by_replica = replication_loop.await?.try_into()?;
+        let total_seen_by_replica: usize = replication_loop.await?.try_into()?;
         let total_inserted = inserted.load(std::sync::atomic::Ordering::Relaxed);
         println!("TOTAL inserted: {}", total_inserted);
         println!("TOTAL seen by replica: {}", total_seen_by_replica);

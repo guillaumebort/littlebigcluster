@@ -1,10 +1,12 @@
+use std::net::SocketAddr;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
 use litecluster::Follower;
 use litecluster::{Leader, LiteCluster};
 use object_store::local::LocalFileSystem;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt;
 
 #[derive(Parser)]
@@ -23,6 +25,14 @@ struct Args {
         global = true,
     )]
     verbose: u8,
+
+    #[arg(short, long)]
+    #[clap(default_value = "127.0.0.1:0")]
+    address: SocketAddr,
+
+    #[arg(long)]
+    #[clap(default_value = "default")]
+    az: String,
 
     #[command(subcommand)]
     command: Command,
@@ -66,8 +76,8 @@ pub async fn main() {
 
     let command_result = match args.command {
         Command::Init => init_cluster(&cluster).await,
-        Command::Leader => leader(cluster).await,
-        Command::Follower => follower(cluster).await,
+        Command::Leader => leader(cluster, args.az, args.address).await,
+        Command::Follower => follower(cluster, args.az).await,
     };
 
     if let Err(err) = command_result {
@@ -76,12 +86,21 @@ pub async fn main() {
     }
 }
 
-async fn leader(cluster: LiteCluster) -> Result<()> {
+async fn leader(cluster: LiteCluster, az: String, address: SocketAddr) -> Result<()> {
+    let router = axum::Router::new().route("/", axum::routing::get(|| async { "LOL" }));
     info!("Waiting to join cluster as leader...");
-    let node = cluster.join_as_leader().await?;
+    let node = cluster.join_as_leader(az, address, router).await?;
     info!("Joined cluster! We are the new leader");
+    info!("Listening on http://{}", node.address());
 
-    wait_exit_signal().await?;
+    select! {
+        _ = wait_exit_signal().fuse() => {
+            info!("Exiting...");
+        }
+        _ = node.wait_lost_leadership().fuse() => {
+            warn!("Lost leadership!?");
+        }
+    }
 
     node.shutdown().await?;
     info!("Exited gracefully");
@@ -89,12 +108,14 @@ async fn leader(cluster: LiteCluster) -> Result<()> {
     Ok(())
 }
 
-async fn follower(cluster: LiteCluster) -> Result<()> {
+async fn follower(cluster: LiteCluster, az: String) -> Result<()> {
     info!("Joining cluster as follower...");
-    let node = cluster.join_as_follower().await?;
+    let node = cluster.join_as_follower(az).await?;
     info!("Joined cluster!");
 
-    let mut watch_leader = node.watch_leader();
+    let mut watch_leader = node.watch_leader().clone();
+    let leader = watch_leader.borrow_and_update().clone();
+    info!(?leader, "Leader is");
 
     loop {
         select! {

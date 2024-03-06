@@ -13,10 +13,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
+use crate::db::{ReadDB, WriteDB};
 use crate::{db::DB, Node};
 
 const SNAPSHOT_INTERVAL: u64 = 30;
-const KEEP_SNAPSHOTS: u64 = 10;
+const KEEP_SNAPSHOTS: usize = 10;
 
 struct Object {
     tmp: NamedTempFile,
@@ -115,6 +116,11 @@ impl Replica {
                         r#"INSERT INTO _lbc VALUES ('cluster_id', ?1);"#,
                         [cluster_id],
                     )?;
+                    txn.execute(r#"INSERT INTO _lbc VALUES ('epoch', 0);"#, [])?;
+                    txn.execute(
+                        r#"INSERT INTO _lbc VALUES ('last_update', datetime());"#,
+                        [],
+                    )?;
                     txn.commit()
                 })
                 .await?;
@@ -162,6 +168,7 @@ impl Replica {
                 SELECT * FROM
                     (SELECT
                         json_extract(value, '$.uuid') AS uuid,
+                        json_extract(value, '$.az') AS az,
                         json_extract(value, '$.address') AS address
                     FROM _lbc
                     WHERE key = 'leader')
@@ -171,12 +178,14 @@ impl Replica {
                 [],
                 |row| {
                     let uuid: String = row.get("uuid")?;
+                    let az: String = row.get("az")?;
                     let address: String = row.get("address")?;
                     let cluster_id: String = row.get("cluster_id")?;
                     let uuid = Uuid::parse_str(&uuid)?;
-                    let address = address.parse()?;
+                    let address = Some(address.parse()?);
                     Ok(Node {
                         cluster_id,
+                        az,
                         uuid,
                         address,
                     })
@@ -196,6 +205,27 @@ impl Replica {
         if next_epoch - self.snapshot_epoch >= SNAPSHOT_INTERVAL {
             self.snapshot().await?;
         }
+
+        let _ = self
+            .db
+            .transaction(move |txn| {
+                txn.execute(
+                    r#"
+                    UPDATE _lbc SET value=?1 WHERE key = 'epoch';
+                    "#,
+                    [next_epoch],
+                )?;
+
+                txn.execute(
+                    r#"
+                    UPDATE _lbc SET value=datetime() WHERE key = 'last_update';
+                    "#,
+                    [],
+                )?;
+
+                txn.commit()
+            })
+            .await?;
 
         match self
             .db
@@ -263,21 +293,34 @@ impl Replica {
         let next_epoch = self.epoch + 1;
 
         // mark us as leader in the DB
-        let leader_ack = if let Some(leader) = new_leader {
-            self.db
-                .execute(
+        let leader_ack = self.db.transaction(move |txn| {
+            if let Some(leader) = new_leader {
+                txn.execute(
                     r#"
-                    INSERT INTO _lbc VALUES('leader', json_object('uuid', ?1, 'address', ?2))
-                    ON CONFLICT DO UPDATE SET value=json_object('uuid', ?1, 'address', ?2);
-                    "#,
-                    [leader.uuid.to_string(), leader.address.to_string()],
-                )
-                .await?
-        } else {
-            self.db
-                .execute(r#"DELETE FROM _lbc WHERE key = 'leader'"#, [])
-                .await?
-        };
+                    INSERT INTO _lbc VALUES('leader', json_object('uuid', ?1, 'address', ?2, 'az', ?3))
+                    ON CONFLICT DO UPDATE SET value=json_object('uuid', ?1, 'address', ?2, 'az', ?3); "#,
+                    (
+                        leader.uuid.to_string(),
+                        leader
+                            .address
+                            .map(|a| a.to_string()).unwrap_or_default(),
+                        leader.az,
+                    ),
+                )?;
+            } else {
+                txn.execute(r#"DELETE FROM _lbc WHERE key = 'leader'"#, [])?;
+            }
+
+            txn.execute(r#"
+            UPDATE _lbc SET value=?1 WHERE key = 'epoch';
+            "#, [next_epoch])?;
+
+            txn.execute(r#"
+            UPDATE _lbc SET value=datetime() WHERE key = 'last_update';
+            "#, [])?;
+
+            txn.commit()
+        }).await?;
 
         // Try to checkpoint for the next epoch
         let object_store = self.object_store.clone();
@@ -363,22 +406,27 @@ impl Replica {
 
         snaphost_epochs.sort_unstable();
         snaphost_epochs.reverse();
-        let (keep, delete) = snaphost_epochs.split_at(KEEP_SNAPSHOTS.try_into()?);
-        debug!(?keep, ?delete, "Found {} snapshots", snaphost_epochs.len());
 
-        let delete_futures = FuturesUnordered::new();
-        for epoch in delete {
-            let path = Self::snapshot_path(*epoch);
-            delete_futures.push(async move {
-                trace!(?path, "Deleting old SNAPSHOT");
-                object_store.delete(&path).await?;
-                anyhow::Ok(())
-            });
-        }
-        if let Err(e) = delete_futures.try_collect::<Vec<_>>().await {
-            error!(?e, "Failed to delete all snapshots");
-        }
-        let latest_snapshot_epoch = keep[0];
+        let latest_snapshot_epoch = if snaphost_epochs.len() > KEEP_SNAPSHOTS {
+            let (keep, delete) = snaphost_epochs.split_at(KEEP_SNAPSHOTS);
+            debug!(?keep, ?delete, "Found {} snapshots", snaphost_epochs.len());
+
+            let delete_futures = FuturesUnordered::new();
+            for epoch in delete {
+                let path = Self::snapshot_path(*epoch);
+                delete_futures.push(async move {
+                    trace!(?path, "Deleting old SNAPSHOT");
+                    object_store.delete(&path).await?;
+                    anyhow::Ok(())
+                });
+            }
+            if let Err(e) = delete_futures.try_collect::<Vec<_>>().await {
+                error!(?e, "Failed to delete all snapshots");
+            }
+            keep[0]
+        } else {
+            snaphost_epochs[0]
+        };
 
         // now delete all WALs that are older than the latest snapshot
         let delete_futures = FuturesUnordered::new();

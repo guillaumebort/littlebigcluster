@@ -1,169 +1,52 @@
-use std::borrow::Cow;
+use std::ops::{Deref, Not};
+use std::sync::atomic::AtomicBool;
 use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use axum::Router;
 use chrono::Utc;
 use object_store::ObjectStore;
-use rusqlite::types::FromSql;
-use rusqlite::{Params, Transaction};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::{select, task::JoinHandle};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
-use crate::db::{Ack, DB};
+use crate::db::{ReadDB, WriteDB, DB};
 use crate::replica::Replica;
+use crate::server::{LeaderState, Server};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub uuid: Uuid,
-    pub address: SocketAddr,
     pub cluster_id: String,
+    pub az: String,
+    pub address: Option<SocketAddr>,
 }
 
 impl Node {
-    pub fn new(cluster_id: String) -> Self {
+    pub fn new(cluster_id: String, az: String, address: Option<SocketAddr>) -> Self {
         let uuid = Uuid::now_v7();
-        let address = "127.0.0.1:8000".parse().unwrap();
         Self {
             uuid,
-            address,
             cluster_id,
+            az,
+            address,
         }
-    }
-}
-
-// ===== DB Access =====
-
-pub trait ReadDB {
-    fn query_row<A>(
-        &self,
-        sql: impl Into<Cow<'static, str>> + Send,
-        params: impl Params + Send + 'static,
-        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
-    ) -> impl Future<Output = Result<A>> + Send
-    where
-        A: Send + 'static;
-
-    fn query_scalar<A>(
-        &self,
-        sql: impl Into<Cow<'static, str>> + Send,
-        params: impl Params + Send + 'static,
-    ) -> impl Future<Output = Result<A>> + Send
-    where
-        A: FromSql + Send + 'static;
-
-    fn readonly_transaction<A>(
-        &self,
-        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
-    ) -> impl Future<Output = Result<A>> + Send
-    where
-        A: Send + 'static;
-}
-
-pub trait WriteDB {
-    fn execute(
-        &self,
-        sql: impl Into<Cow<'static, str>> + Send,
-        params: impl Params + Send + 'static,
-    ) -> impl Future<Output = Result<Ack<usize>>> + Send;
-
-    fn execute_batch(
-        &self,
-        sql: impl Into<Cow<'static, str>> + Send,
-    ) -> impl Future<Output = Result<Ack<()>>> + Send;
-
-    fn transaction<A>(
-        &self,
-        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
-    ) -> impl Future<Output = Result<Ack<A>>> + Send
-    where
-        A: Send + Unpin + 'static;
-}
-
-trait HasDB {
-    fn db(&self) -> &DB;
-}
-
-impl<X> ReadDB for X
-where
-    X: HasDB,
-{
-    fn query_row<A>(
-        &self,
-        sql: impl Into<Cow<'static, str>> + Send,
-        params: impl Params + Send + 'static,
-        f: impl FnOnce(&rusqlite::Row<'_>) -> Result<A> + Send + 'static,
-    ) -> impl Future<Output = Result<A>> + Send
-    where
-        A: Send + 'static,
-    {
-        self.db().query_row(sql, params, f)
-    }
-
-    fn query_scalar<A>(
-        &self,
-        sql: impl Into<Cow<'static, str>> + Send,
-        params: impl Params + Send + 'static,
-    ) -> impl Future<Output = Result<A>> + Send
-    where
-        A: FromSql + Send + 'static,
-    {
-        self.db().query_scalar(sql, params)
-    }
-
-    fn readonly_transaction<A>(
-        &self,
-        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
-    ) -> impl Future<Output = Result<A>> + Send
-    where
-        A: Send + 'static,
-    {
-        self.db().readonly_transaction(thunk)
-    }
-}
-
-impl<X> WriteDB for X
-where
-    X: HasDB,
-{
-    fn execute(
-        &self,
-        sql: impl Into<Cow<'static, str>> + Send,
-        params: impl Params + Send + 'static,
-    ) -> impl Future<Output = Result<Ack<usize>>> + Send {
-        self.db().execute(sql, params)
-    }
-
-    fn execute_batch(
-        &self,
-        sql: impl Into<Cow<'static, str>> + Send,
-    ) -> impl Future<Output = Result<Ack<()>>> + Send {
-        self.db().execute_batch(sql)
-    }
-
-    fn transaction<A>(
-        &self,
-        thunk: impl FnOnce(Transaction) -> rusqlite::Result<A> + Send + 'static,
-    ) -> impl Future<Output = Result<Ack<A>>> + Send
-    where
-        A: Send + Unpin + 'static,
-    {
-        self.db().transaction(thunk)
     }
 }
 
 // ===== Follower =====
 
 pub trait Follower: ReadDB {
-    fn watch_leader(&self) -> watch::Receiver<Option<Node>>;
+    fn watch_leader(&self) -> &watch::Receiver<Option<Node>>;
 }
 
 #[derive(Debug)]
 pub struct FollowerNode {
     db: DB,
     watch_leader_node: watch::Receiver<Option<Node>>,
+    #[allow(unused)]
     cancel: DropGuard,
 }
 
@@ -211,15 +94,17 @@ impl FollowerNode {
     }
 }
 
-impl HasDB for FollowerNode {
-    fn db(&self) -> &DB {
+impl Deref for FollowerNode {
+    type Target = DB;
+
+    fn deref(&self) -> &Self::Target {
         &self.db
     }
 }
 
 impl Follower for FollowerNode {
-    fn watch_leader(&self) -> watch::Receiver<Option<Node>> {
-        self.watch_leader_node.clone()
+    fn watch_leader(&self) -> &watch::Receiver<Option<Node>> {
+        &self.watch_leader_node
     }
 }
 
@@ -227,27 +112,72 @@ impl Follower for FollowerNode {
 
 pub trait Leader: ReadDB + WriteDB {
     fn shutdown(self) -> impl Future<Output = Result<()>>;
+
+    fn wait_lost_leadership(&self) -> impl Future<Output = ()>;
+
+    fn address(&self) -> SocketAddr;
+}
+
+#[derive(Clone, Debug)]
+pub struct LeaderStatus {
+    is_leader: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl LeaderStatus {
+    pub fn new() -> Self {
+        Self {
+            is_leader: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn set_leader(&self, is_leader: bool) {
+        self.is_leader
+            .store(is_leader, std::sync::atomic::Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_leader(&self) -> bool {
+        self.is_leader.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug)]
 pub struct LeaderNode {
     db: DB,
+    server: Server,
+    leader_status: LeaderStatus,
     keep_alive: JoinHandle<Replica>,
     cancel: DropGuard,
 }
 
 impl LeaderNode {
-    pub async fn join(node: Node, object_store: Arc<dyn ObjectStore>) -> Result<Self> {
+    pub async fn join(
+        mut node: Node,
+        router: Router<LeaderState>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self> {
         debug!(?node, "Joining cluster as Leader");
+        let leader_status = LeaderStatus::new();
 
         // Open the replica
         let replica = Replica::open(&node.cluster_id, object_store).await?;
 
+        // Start the server
+        let server =
+            Server::start(&mut node, router, leader_status.clone(), replica.owned_db()).await?;
+
         // Return the node only after acquiring leadership
-        Self::wait_for_leadership(node, replica).await
+        Self::wait_for_leadership(node, leader_status, replica, server).await
     }
 
-    async fn wait_for_leadership(node: Node, mut replica: Replica) -> Result<Self> {
+    async fn wait_for_leadership(
+        node: Node,
+        leader_status: LeaderStatus,
+        mut replica: Replica,
+        server: Server,
+    ) -> Result<Self> {
         debug!("Waiting for leadership...");
         loop {
             // Refresh the replica
@@ -272,6 +202,7 @@ impl LeaderNode {
                     Ok(()) => {
                         // We are the leader!
                         debug!("Acquired leadership");
+                        leader_status.set_leader(true);
 
                         // Get a (read-write) DB
                         let db = replica.owned_db();
@@ -279,12 +210,17 @@ impl LeaderNode {
                         // Spawn a keep-alive task incrementing the epoch and safely synchronizing the DB
                         // until the leader is dropped or explicitly shutdown
                         let cancel = CancellationToken::new();
-                        let keep_alive =
-                            tokio::spawn(Self::keep_alive(node, replica, cancel.child_token()));
+                        let keep_alive = tokio::spawn(Self::keep_alive(
+                            leader_status.clone(),
+                            replica,
+                            cancel.child_token(),
+                        ));
                         let cancel = cancel.drop_guard();
 
                         return Ok(Self {
                             db,
+                            server,
+                            leader_status,
                             keep_alive,
                             cancel,
                         });
@@ -298,7 +234,11 @@ impl LeaderNode {
         }
     }
 
-    async fn keep_alive(node: Node, mut replica: Replica, cancel: CancellationToken) -> Replica {
+    async fn keep_alive(
+        is_leader: LeaderStatus,
+        mut replica: Replica,
+        cancel: CancellationToken,
+    ) -> Replica {
         while !cancel.is_cancelled() {
             select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
@@ -312,26 +252,45 @@ impl LeaderNode {
                 _ = cancel.cancelled() => break,
             }
         }
+        is_leader.set_leader(false);
         replica
-    }
-
-    pub async fn shutdown(self) -> Result<()> {
-        drop(self.cancel);
-        let mut replica = self.keep_alive.await?;
-        replica.try_change_leader(None).await?;
-        debug!("Released leadership");
-        Ok(())
     }
 }
 
-impl HasDB for LeaderNode {
-    fn db(&self) -> &DB {
+impl Deref for LeaderNode {
+    type Target = DB;
+
+    fn deref(&self) -> &Self::Target {
         &self.db
     }
 }
 
 impl Leader for LeaderNode {
     async fn shutdown(self) -> Result<()> {
-        LeaderNode::shutdown(self).await
+        // Gracefully shutdown the server
+        self.server.shutdown().await?;
+
+        // Stop keep-alive task
+        drop(self.cancel);
+
+        // Release leadership
+        if self.leader_status.is_leader() {
+            let mut replica = self.keep_alive.await?;
+            debug!("Releasing leadership...");
+            replica.try_change_leader(None).await?;
+            debug!("Released leadership");
+        }
+
+        Ok(())
+    }
+
+    async fn wait_lost_leadership(&self) {
+        while self.leader_status.is_leader() {
+            self.leader_status.notify.notified().await;
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.server.address
     }
 }
