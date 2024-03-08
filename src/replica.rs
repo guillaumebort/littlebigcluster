@@ -197,7 +197,7 @@ impl Replica {
     /// Try to increment the epoch and create a new WAL
     /// This is an atomic operation that only the current leader is allowed to do
     /// If there is a conflict it means that the current node is not the leader anymore
-    pub async fn incr_epoch(&mut self) -> Result<()> {
+    pub async fn incr_epoch(&mut self) -> Result<u64> {
         let next_epoch = self.epoch + 1;
         let object_store = self.object_store.clone();
 
@@ -245,7 +245,7 @@ impl Replica {
         {
             Ok(()) => {
                 self.epoch = next_epoch;
-                Ok(())
+                Ok(next_epoch)
             }
             Err(e) => {
                 // So we are not leader anymore

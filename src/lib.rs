@@ -7,7 +7,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use axum::Router;
-pub use node::{Follower, Leader, Node};
+pub use node::{Follower, Leader, Node, StandByLeader};
 use node::{FollowerNode, LeaderNode};
 use object_store::ObjectStore;
 use replica::Replica;
@@ -37,7 +37,7 @@ impl LiteCluster {
         az: String,
         address: SocketAddr,
         router: Router<LeaderState>,
-    ) -> Result<impl Leader> {
+    ) -> Result<impl StandByLeader> {
         let node = Node::new(self.cluster_id, az, Some(address));
         LeaderNode::join(node, router, self.object_store).await
     }

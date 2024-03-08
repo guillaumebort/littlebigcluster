@@ -3,8 +3,7 @@ use std::net::SocketAddr;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
-use litecluster::Follower;
-use litecluster::{Leader, LiteCluster};
+use litecluster::{Follower, Leader, LiteCluster, StandByLeader};
 use object_store::local::LocalFileSystem;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt;
@@ -88,16 +87,18 @@ pub async fn main() {
 
 async fn leader(cluster: LiteCluster, az: String, address: SocketAddr) -> Result<()> {
     let router = axum::Router::new().route("/", axum::routing::get(|| async { "LOL" }));
-    info!("Waiting to join cluster as leader...");
+    info!("Joining cluster as leader...");
     let node = cluster.join_as_leader(az, address, router).await?;
-    info!("Joined cluster! We are the new leader");
+    info!("Joined cluster! Waiting for leadership...");
+    let node = node.wait_for_leadership().await?;
+    info!("We are the new leader!");
     info!("Listening on http://{}", node.address());
 
     select! {
         _ = wait_exit_signal().fuse() => {
             info!("Exiting...");
         }
-        _ = node.wait_lost_leadership().fuse() => {
+        _ = node.lost_leadership().fuse() => {
             warn!("Lost leadership!?");
         }
     }

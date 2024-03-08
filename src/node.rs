@@ -1,13 +1,13 @@
-use std::ops::{Deref, Not};
+use std::ops::Deref;
 use std::sync::atomic::AtomicBool;
 use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use axum::Router;
 use chrono::Utc;
 use object_store::ObjectStore;
-use tokio::sync::{watch, Notify};
-use tokio::{select, task::JoinHandle};
+use tokio::select;
+use tokio::sync::{watch, Notify, RwLock};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
@@ -113,9 +113,13 @@ impl Follower for FollowerNode {
 pub trait Leader: ReadDB + WriteDB {
     fn shutdown(self) -> impl Future<Output = Result<()>>;
 
-    fn wait_lost_leadership(&self) -> impl Future<Output = ()>;
+    fn lost_leadership(&self) -> impl Future<Output = ()>;
 
     fn address(&self) -> SocketAddr;
+}
+
+pub trait StandByLeader: ReadDB {
+    fn wait_for_leadership(self) -> impl Future<Output = Result<impl Leader>>;
 }
 
 #[derive(Clone, Debug)]
@@ -145,10 +149,11 @@ impl LeaderStatus {
 
 #[derive(Debug)]
 pub struct LeaderNode {
+    node: Node,
+    replica: Arc<RwLock<Replica>>,
     db: DB,
     server: Server,
     leader_status: LeaderStatus,
-    keep_alive: JoinHandle<Replica>,
     cancel: DropGuard,
 }
 
@@ -163,23 +168,64 @@ impl LeaderNode {
 
         // Open the replica
         let replica = Replica::open(&node.cluster_id, object_store).await?;
+        let db: DB = replica.owned_db();
+        let replica = Arc::new(RwLock::new(replica));
 
         // Start the server
-        let server =
-            Server::start(&mut node, router, leader_status.clone(), replica.owned_db()).await?;
+        let server = Server::start(&mut node, router, leader_status.clone(), db.clone()).await?;
 
-        // Return the node only after acquiring leadership
-        Self::wait_for_leadership(node, leader_status, replica, server).await
+        // drop guard so we stop everything when the leader is dropped
+        let cancel = CancellationToken::new().drop_guard();
+
+        Ok(Self {
+            node,
+            replica,
+            db,
+            server,
+            leader_status,
+            cancel,
+        })
     }
 
-    async fn wait_for_leadership(
-        node: Node,
-        leader_status: LeaderStatus,
-        mut replica: Replica,
-        server: Server,
-    ) -> Result<Self> {
+    async fn keep_alive(
+        is_leader: LeaderStatus,
+        replica: Arc<RwLock<Replica>>,
+        cancel: CancellationToken,
+    ) {
+        while !cancel.is_cancelled() {
+            select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    match replica.write().await.incr_epoch().await {
+                        Ok(epoch) => {
+                            trace!(epoch, "Replica epoch incremented");
+                        }
+                        Err(err) => {
+                            error!(?err, "Cannot increment epoch, leader fenced? Giving up");
+                            break;
+                        }
+                    }
+                }
+                _ = cancel.cancelled() => break,
+            }
+        }
+        // ooops, we lost leadership
+        is_leader.set_leader(false);
+    }
+}
+
+impl Deref for LeaderNode {
+    type Target = DB;
+
+    fn deref(&self) -> &Self::Target {
+        &self.db
+    }
+}
+
+impl StandByLeader for LeaderNode {
+    async fn wait_for_leadership(mut self) -> Result<impl Leader> {
         debug!("Waiting for leadership...");
         loop {
+            let mut replica = self.replica.write().await;
             // Refresh the replica
             replica.refresh().await?;
 
@@ -198,32 +244,24 @@ impl LeaderNode {
                 );
 
                 // Try to acquire leadership (this is a race with other nodes)
-                match replica.try_change_leader(Some(node.clone())).await {
+                match replica.try_change_leader(Some(self.node.clone())).await {
                     Ok(()) => {
                         // We are the leader!
                         debug!("Acquired leadership");
-                        leader_status.set_leader(true);
-
-                        // Get a (read-write) DB
-                        let db = replica.owned_db();
+                        self.leader_status.set_leader(true);
 
                         // Spawn a keep-alive task incrementing the epoch and safely synchronizing the DB
                         // until the leader is dropped or explicitly shutdown
-                        let cancel = CancellationToken::new();
-                        let keep_alive = tokio::spawn(Self::keep_alive(
-                            leader_status.clone(),
-                            replica,
+                        let cancel = self.cancel.disarm();
+                        tokio::spawn(Self::keep_alive(
+                            self.leader_status.clone(),
+                            self.replica.clone(),
                             cancel.child_token(),
                         ));
-                        let cancel = cancel.drop_guard();
+                        self.cancel = cancel.drop_guard();
+                        drop(replica);
 
-                        return Ok(Self {
-                            db,
-                            server,
-                            leader_status,
-                            keep_alive,
-                            cancel,
-                        });
+                        return Ok(self);
                     }
                     Err(err) => {
                         debug!(?err, "Failed to acquire leadership");
@@ -233,40 +271,10 @@ impl LeaderNode {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-
-    async fn keep_alive(
-        is_leader: LeaderStatus,
-        mut replica: Replica,
-        cancel: CancellationToken,
-    ) -> Replica {
-        while !cancel.is_cancelled() {
-            select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if let Err(err) = replica.incr_epoch().await {
-                        error!(?err, "Cannot increment epoch, leader fenced? Giving up");
-                        break;
-                    } else {
-                        trace!(epoch = replica.epoch(), "Replica epoch incremented");
-                    }
-                }
-                _ = cancel.cancelled() => break,
-            }
-        }
-        is_leader.set_leader(false);
-        replica
-    }
-}
-
-impl Deref for LeaderNode {
-    type Target = DB;
-
-    fn deref(&self) -> &Self::Target {
-        &self.db
-    }
 }
 
 impl Leader for LeaderNode {
-    async fn shutdown(self) -> Result<()> {
+    async fn shutdown(mut self) -> Result<()> {
         // Gracefully shutdown the server
         self.server.shutdown().await?;
 
@@ -274,17 +282,27 @@ impl Leader for LeaderNode {
         drop(self.cancel);
 
         // Release leadership
-        if self.leader_status.is_leader() {
-            let mut replica = self.keep_alive.await?;
-            debug!("Releasing leadership...");
-            replica.try_change_leader(None).await?;
-            debug!("Released leadership");
+        loop {
+            match Arc::try_unwrap(self.replica) {
+                Ok(replica) => {
+                    let mut replica = replica.into_inner();
+                    assert!(!self.leader_status.is_leader());
+                    debug!("Releasing leadership...");
+                    replica.try_change_leader(None).await?;
+                    debug!("Released leadership");
+                    break;
+                }
+                Err(replica) => {
+                    self.replica = replica;
+                    tokio::task::yield_now().await;
+                }
+            }
         }
 
         Ok(())
     }
 
-    async fn wait_lost_leadership(&self) {
+    async fn lost_leadership(&self) {
         while self.leader_status.is_leader() {
             self.leader_status.notify.notified().await;
         }
