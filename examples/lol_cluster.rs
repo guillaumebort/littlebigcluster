@@ -5,8 +5,12 @@ use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
 use litecluster::{Follower, Leader, LiteCluster, StandByLeader};
 use object_store::local::LocalFileSystem;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::fmt;
+use tracing::{error, info, level_filters::LevelFilter, warn, Level};
+use tracing_subscriber::{
+    filter,
+    layer::{Layer, SubscriberExt},
+    util::SubscriberInitExt,
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -52,16 +56,60 @@ pub async fn main() {
     let args = Args::parse();
 
     match args.verbose {
-        0 => tracing_subscriber::fmt()
-            .event_format(fmt::format().compact())
+        0 => tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(tracing_subscriber::fmt::format().compact())
+                    .with_filter(tracing_subscriber::filter::filter_fn(
+                        |metadata| match *metadata.level() {
+                            Level::WARN | Level::ERROR => true,
+                            Level::INFO if metadata.target().starts_with("lol_cluster") => true,
+                            _ => false,
+                        },
+                    )),
+            )
             .init(),
-        1 => tracing_subscriber::fmt()
-            .with_max_level(Level::DEBUG)
-            .event_format(fmt::format())
+        1 => tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(tracing_subscriber::fmt::format())
+                    .with_filter(tracing_subscriber::filter::filter_fn(
+                        |metadata| match *metadata.level() {
+                            Level::WARN | Level::ERROR => true,
+                            Level::INFO | Level::DEBUG
+                                if metadata.target().starts_with("lol_cluster")
+                                    || metadata.target().starts_with("littlecluster") =>
+                            {
+                                true
+                            }
+                            _ => false,
+                        },
+                    )),
+            )
             .init(),
-        _ => tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .event_format(fmt::format().pretty())
+        2 => tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(tracing_subscriber::fmt::format().pretty())
+                    .with_filter(tracing_subscriber::filter::filter_fn(
+                        |metadata| match *metadata.level() {
+                            Level::WARN | Level::ERROR | Level::INFO => true,
+                            Level::DEBUG | Level::TRACE
+                                if metadata.target().starts_with("lol_cluster")
+                                    || metadata.target().starts_with("littlecluster") =>
+                            {
+                                true
+                            }
+                            _ => false,
+                        },
+                    )),
+            )
+            .init(),
+        _ => tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(tracing_subscriber::fmt::format().pretty()),
+            )
             .init(),
     };
 

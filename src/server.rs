@@ -2,19 +2,23 @@ use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use axum::{
-    debug_handler, extract::State, http::StatusCode, response::IntoResponse, routing::get, Json,
-    Router,
+    debug_handler,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
 };
 use futures::FutureExt;
 use serde_json::{json, Value};
-use tokio::{sync::oneshot, task::JoinHandle};
+use sqlx::any;
+use tokio::{
+    sync::{oneshot, RwLock},
+    task::JoinHandle,
+};
 use tracing::{debug, error};
 
-use crate::{
-    db::{ReadDB, DB},
-    node::LeaderStatus,
-    Node,
-};
+use crate::{db::DB, node::LeaderStatus, replica::Replica, Node};
 
 #[derive(Debug)]
 pub struct Server {
@@ -23,50 +27,38 @@ pub struct Server {
     serve: JoinHandle<Result<(), std::io::Error>>,
 }
 
+#[derive(Debug)]
+struct LeaderStateInner {
+    node: Node,
+    leader_status: LeaderStatus,
+    replica: Arc<RwLock<Replica>>,
+    db: DB,
+}
+
 #[derive(Clone, Debug)]
 pub struct LeaderState {
-    inner: Arc<(Node, LeaderStatus, DB)>,
+    inner: Arc<LeaderStateInner>,
 }
 
 impl LeaderState {
-    pub fn new(node: Node, leader_status: LeaderStatus, db: DB) -> Self {
+    pub(crate) async fn new(
+        node: Node,
+        leader_status: LeaderStatus,
+        replica: Arc<RwLock<Replica>>,
+    ) -> Self {
+        let db = replica.read().await.owned_db().clone();
         Self {
-            inner: Arc::new((node, leader_status, db)),
+            inner: Arc::new(LeaderStateInner {
+                node,
+                leader_status,
+                replica,
+                db,
+            }),
         }
     }
 
     pub fn is_leader(&self) -> bool {
-        self.inner.1.is_leader()
-    }
-
-    pub async fn debug(&self) -> Result<Value> {
-        let (leader, db_path, db_size, epoch, last_update) = self.inner.2.readonly_transaction(|c| {
-            let leader: String = c.query_row("SELECT value FROM _lbc WHERE key = 'leader'", [], |row| row.get(0))?;
-            let db_path = c.path().map(|p| p.to_owned()).unwrap_or_default();
-            let db_size: u64 = c.query_row(r#"SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()"#, [], |row| row.get(0))?;
-            let epoch: u64 = c.query_row("SELECT value FROM _lbc WHERE key = 'epoch'", [], |row| row.get(0))?;
-            let last_update: String = c.query_row("SELECT value FROM _lbc WHERE key = 'last_update'", [], |row| row.get(0))?;
-            Ok((leader, db_path, db_size, epoch, last_update))
-        }).await?;
-
-        Ok(json!({
-          "cluster_id": self.inner.0.cluster_id,
-          "leader": leader,
-          "node": {
-            "uuid": self.inner.0.uuid.to_string(),
-            "az": self.inner.0.az,
-            "address": self.inner.0.address.map(|a| a.to_string()).unwrap_or_default(),
-          },
-          "status": if self.is_leader() { "leader" } else { "standby" },
-          "db": {
-                "path": db_path,
-                "size": db_size,
-              },
-              "replica": {
-                "epoch": epoch,
-                "last_update": last_update,
-              }
-        }))
+        self.inner.leader_status.is_leader()
     }
 }
 
@@ -75,7 +67,7 @@ impl Server {
         node: &mut Node,
         router: Router<LeaderState>,
         leader_status: LeaderStatus,
-        db: DB,
+        replica: Arc<RwLock<Replica>>,
     ) -> Result<Self> {
         let address = node
             .address
@@ -88,11 +80,7 @@ impl Server {
         let router = Router::new()
             .nest("/_lbc", system_router)
             .merge(router)
-            .with_state(LeaderState::new(
-                node.clone(),
-                leader_status.clone(),
-                db.clone(),
-            ));
+            .with_state(LeaderState::new(node.clone(), leader_status, replica).await);
 
         let (notify_shutdown, on_shutdow) = tokio::sync::oneshot::channel();
         let serve = tokio::spawn(
@@ -121,12 +109,55 @@ impl Server {
 }
 
 #[debug_handler]
-async fn status(State(state): State<LeaderState>) -> impl IntoResponse {
-    match state.debug().await {
-        Ok(value) => Ok(Json(value)),
-        Err(e) => {
-            error!(?e, "Failed to get status");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+async fn status(State(state): State<LeaderState>) -> JsonResponse {
+    let replica = state.inner.replica.read().await;
+    Ok(Json(json!({
+        "cluster_id": state.inner.node.cluster_id,
+        "node": {
+            "uuid": state.inner.node.uuid.to_string(),
+            "az": state.inner.node.az,
+            "address": state.inner.node.address.map(|a| a.to_string()).unwrap_or_default(),
+        },
+        "leader": (if let Some(leader) = replica.leader().await? {
+            json!({
+                "uuid": leader.uuid.to_string(),
+                "az": leader.az,
+                "address": leader.address.map(|a| a.to_string()).unwrap_or_default(),
+            })
+        } else {
+            json!(null)
+        }),
+        "replica": {
+            "epoch": replica.epoch(),
+            "last_update": replica.last_update().await?.to_rfc3339(),
+        },
+        "db": {
+            "path": state.inner.db.path().display().to_string(),
+            "size": tokio::fs::metadata(state.inner.db.path()).await?.len(),
+        },
+        "status": (if state.is_leader() { "leader" } else { "standby" }),
+    })))
+}
+
+type JsonResponse = Result<Json<serde_json::Value>, ServerError>;
+
+struct ServerError(anyhow::Error);
+
+impl IntoResponse for ServerError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": self.0.to_string() })),
+        )
+            .into_response()
+    }
+}
+
+impl<E> From<E> for ServerError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
     }
 }

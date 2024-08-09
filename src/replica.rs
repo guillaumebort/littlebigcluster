@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::{
@@ -13,35 +13,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
-use crate::{
-    db::{ReadDB, WriteDB, DB},
-    Node,
-};
+use crate::{db::DB, Node};
 
-const SNAPSHOT_INTERVAL: u64 = 30;
+const SNAPSHOT_INTERVAL: u32 = 30;
 const KEEP_SNAPSHOTS: usize = 10;
-
-struct Object {
-    tmp: NamedTempFile,
-    last_modified: DateTime<Utc>,
-}
-
-impl Object {
-    pub fn path(&self) -> &std::path::Path {
-        self.tmp.path()
-    }
-
-    pub fn last_modified(&self) -> DateTime<Utc> {
-        self.last_modified
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct Replica {
     pub object_store: Arc<dyn ObjectStore>,
-    last_modified: DateTime<Utc>,
-    snapshot_epoch: u64,
-    epoch: u64,
+    snapshot_epoch: u32,
+    epoch: u32,
     db: DB,
 }
 
@@ -54,15 +35,16 @@ impl Replica {
         let snapshot_epoch = Self::latest_snapshot_epoch(&object_store).await?;
         debug!(snapshot_epoch, ?object_store, "Restoring snapshot");
         let snapshot = Self::get(&object_store, Self::snapshot_path(snapshot_epoch)).await?;
-        let last_modified = snapshot.last_modified();
 
         // Create a DB from the snapshot
         let db = DB::open(Some(snapshot.path())).await?;
 
         // verify cluster ID
-        let db_cluster_id = db
-            .query_scalar::<String>(r#"SELECT value FROM _lbc WHERE key = 'cluster_id'"#, [])
-            .await?;
+        let db_cluster_id: String =
+            sqlx::query_scalar(r#"SELECT value FROM litecluster WHERE key = 'cluster_id'"#)
+                .fetch_one(&db)
+                .await?;
+
         if db_cluster_id != cluster_id {
             bail!(
                 "Cluster ID mismatch: expected {}, got {}",
@@ -74,7 +56,6 @@ impl Replica {
         // Replay WAL
         let mut replica = Replica {
             object_store,
-            last_modified,
             snapshot_epoch,
             epoch: snapshot_epoch,
             db,
@@ -112,18 +93,26 @@ impl Replica {
 
             // Initialize the system table
             let ack = db
-                .transaction(|txn| {
-                    txn.execute_batch(r#"CREATE TABLE litecluster (key TEXT PRIMARY KEY, value ANY)"#)?;
-                    txn.execute(
-                        r#"INSERT INTO _lbc VALUES ('cluster_id', ?1);"#,
-                        [cluster_id],
-                    )?;
-                    txn.execute(r#"INSERT INTO _lbc VALUES ('epoch', 0);"#, [])?;
-                    txn.execute(
-                        r#"INSERT INTO _lbc VALUES ('last_update', datetime());"#,
-                        [],
-                    )?;
-                    txn.commit()
+                .transaction(|mut txn| {
+                    async move {
+                        sqlx::query(r#"CREATE TABLE litecluster (key TEXT PRIMARY KEY, value ANY)"#)
+                            .execute(&mut *txn)
+                            .await?;
+                        sqlx::query(r#"INSERT INTO litecluster VALUES ('cluster_id', ?1)"#)
+                            .bind(cluster_id)
+                            .execute(&mut *txn)
+                            .await?;
+                        sqlx::query(r#"INSERT INTO litecluster VALUES ('epoch', 0)"#)
+                            .execute(&mut *txn)
+                            .await?;
+                        sqlx::query(r#"INSERT INTO litecluster VALUES ('last_update', ?1)"#)
+                            .bind(Utc::now().to_rfc3339())
+                            .execute(&mut *txn)
+                            .await?;
+
+                        txn.commit().await
+                    }
+                    .boxed()
                 })
                 .await?;
 
@@ -150,7 +139,7 @@ impl Replica {
         Ok(())
     }
 
-    pub fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> u32 {
         self.epoch
     }
 
@@ -158,48 +147,49 @@ impl Replica {
         self.db.clone()
     }
 
-    pub fn last_update(&self) -> DateTime<Utc> {
-        self.last_modified
+    pub async fn last_update(&self) -> Result<DateTime<Utc>> {
+        let last_update: String =
+            sqlx::query_scalar(r#"SELECT value FROM litecluster WHERE key = 'last_update'"#)
+                .fetch_one(&self.db)
+                .await?;
+        Ok(DateTime::parse_from_rfc3339(&last_update)
+            .context("cannot parse `last_update` date")?
+            .with_timezone(&Utc))
     }
 
     /// Retrieve the leader for the replica current epoch
     pub async fn leader(&self) -> Result<Option<Node>> {
-        self.db
-            .query_row_opt(
-                r#"
-                SELECT * FROM
-                    (SELECT
-                        json_extract(value, '$.uuid') AS uuid,
-                        json_extract(value, '$.az') AS az,
-                        json_extract(value, '$.address') AS address
-                    FROM _lbc
-                    WHERE key = 'leader')
-                    JOIN
-                    (SELECT value AS cluster_id FROM _lbc WHERE key = 'cluster_id')
-                "#,
-                [],
-                |row| {
-                    let uuid: String = row.get("uuid")?;
-                    let az: String = row.get("az")?;
-                    let address: String = row.get("address")?;
-                    let cluster_id: String = row.get("cluster_id")?;
-                    let uuid = Uuid::parse_str(&uuid)?;
-                    let address = Some(address.parse()?);
-                    Ok(Node {
-                        cluster_id,
-                        az,
-                        uuid,
-                        address,
-                    })
-                },
-            )
-            .await
+        let maybe_node: Option<(String, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT * FROM
+                (SELECT
+                    json_extract(value, '$.uuid') AS uuid,
+                    json_extract(value, '$.az') AS az,
+                    json_extract(value, '$.address') AS address
+                FROM litecluster
+                WHERE key = 'leader')
+                JOIN
+                (SELECT value AS cluster_id FROM litecluster WHERE key = 'cluster_id')
+            "#,
+        )
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(if let Some((uuid, az, address, cluster_id)) = maybe_node {
+            Some(Node {
+                uuid: Uuid::parse_str(&uuid)?,
+                az,
+                address: address.parse().ok(),
+                cluster_id,
+            })
+        } else {
+            None
+        })
     }
 
     /// Try to increment the epoch and create a new WAL
     /// This is an atomic operation that only the current leader is allowed to do
     /// If there is a conflict it means that the current node is not the leader anymore
-    pub async fn incr_epoch(&mut self) -> Result<u64> {
+    pub async fn incr_epoch(&mut self) -> Result<u32> {
         let next_epoch = self.epoch + 1;
         let object_store = self.object_store.clone();
 
@@ -210,22 +200,20 @@ impl Replica {
 
         let _ = self
             .db
-            .transaction(move |txn| {
-                txn.execute(
-                    r#"
-                    UPDATE _lbc SET value=?1 WHERE key = 'epoch';
-                    "#,
-                    [next_epoch],
-                )?;
+            .transaction(move |mut txn| {
+                async move {
+                    sqlx::query(r#"UPDATE litecluster SET value=?1 WHERE key = 'epoch'"#)
+                        .bind(next_epoch)
+                        .execute(&mut *txn)
+                        .await?;
+                    sqlx::query(r#"UPDATE litecluster SET value=?1 WHERE key = 'last_update'"#)
+                        .bind(Utc::now().to_rfc3339())
+                        .execute(&mut *txn)
+                        .await?;
 
-                txn.execute(
-                    r#"
-                    UPDATE _lbc SET value=datetime() WHERE key = 'last_update';
-                    "#,
-                    [],
-                )?;
-
-                txn.commit()
+                    txn.commit().await
+                }
+                .boxed()
             })
             .await?;
 
@@ -279,7 +267,7 @@ impl Replica {
             {
                 error!(?e, "Failed to upload snapshot for epoch {}", snapshot_epoch);
             } else {
-                debug!(snapshot_epoch, "Snapshot uploaded");
+                trace!(snapshot_epoch, "Snapshot uploaded");
                 // So it's maybe time to GC
                 if let Err(e) = Self::gc(&object_store).await {
                     error!(?e, "Failed to GC after snapshot");
@@ -295,34 +283,29 @@ impl Replica {
         let next_epoch = self.epoch + 1;
 
         // mark us as leader in the DB
-        let leader_ack = self.db.transaction(move |txn| {
+        let leader_ack = self.db.transaction(move |mut txn| async move {
             if let Some(leader) = new_leader {
-                txn.execute(
+                sqlx::query(
                     r#"
-                    INSERT INTO _lbc VALUES('leader', json_object('uuid', ?1, 'address', ?2, 'az', ?3))
-                    ON CONFLICT DO UPDATE SET value=json_object('uuid', ?1, 'address', ?2, 'az', ?3); "#,
-                    (
-                        leader.uuid.to_string(),
-                        leader
-                            .address
-                            .map(|a| a.to_string()).unwrap_or_default(),
-                        leader.az,
-                    ),
-                )?;
+                    INSERT INTO litecluster VALUES('leader', json_object('uuid', ?1, 'address', ?2, 'az', ?3))
+                    ON CONFLICT DO UPDATE SET value=json_object('uuid', ?1, 'address', ?2, 'az', ?3)
+                    "#,
+                )
+                .bind(leader.uuid.to_string())
+                .bind(leader
+                    .address
+                    .map(|a| a.to_string()).unwrap_or_default()
+                )
+                .bind(leader.az).execute(&mut *txn).await?;
             } else {
-                txn.execute(r#"DELETE FROM _lbc WHERE key = 'leader'"#, [])?;
+                sqlx::query(r#"DELETE FROM litecluster WHERE key = 'leader'"#).execute(&mut *txn).await?;
             }
 
-            txn.execute(r#"
-            UPDATE _lbc SET value=?1 WHERE key = 'epoch';
-            "#, [next_epoch])?;
+            sqlx::query(r#"UPDATE litecluster SET value=?1 WHERE key = 'epoch'"#).bind(next_epoch).execute(&mut *txn).await?;
+            sqlx::query(r#"UPDATE litecluster SET value=?1 WHERE key = 'last_update'"#).bind(Utc::now().to_rfc3339()).execute(&mut *txn).await?;
 
-            txn.execute(r#"
-            UPDATE _lbc SET value=datetime() WHERE key = 'last_update';
-            "#, [])?;
-
-            txn.commit()
-        }).await?;
+            txn.commit().await
+        }.boxed()).await?;
 
         // Try to checkpoint for the next epoch
         let object_store = self.object_store.clone();
@@ -359,7 +342,6 @@ impl Replica {
             Self::get_if_exists(&self.object_store, Self::wal_path(self.epoch + 1)).await?
         {
             self.db.apply_wal(wal.path()).await?;
-            self.last_modified = wal.last_modified();
             self.epoch += 1;
             trace!(epoch = self.epoch, "Refreshed replica");
         }
@@ -379,7 +361,6 @@ impl Replica {
             while let Some((epoch, wal)) = wals.next().await {
                 let wal = wal?;
                 self.db.apply_wal(wal.path()).await?;
-                self.last_modified = wal.last_modified();
                 trace!(epoch, "Refreshed replica");
             }
         }
@@ -396,7 +377,7 @@ impl Replica {
                 .location
                 .filename()
                 .and_then(|filename| filename.strip_suffix(".db"))
-                .and_then(|filename| filename.parse::<u64>().ok())
+                .and_then(|filename| filename.parse::<u32>().ok())
             {
                 snaphost_epochs.push(epoch);
             }
@@ -411,7 +392,12 @@ impl Replica {
 
         let latest_snapshot_epoch = if snaphost_epochs.len() > KEEP_SNAPSHOTS {
             let (keep, delete) = snaphost_epochs.split_at(KEEP_SNAPSHOTS);
-            debug!(?keep, ?delete, "Found {} snapshots", snaphost_epochs.len());
+            debug!(
+                ?keep,
+                ?delete,
+                "GC Found {} snapshots",
+                snaphost_epochs.len()
+            );
 
             let delete_futures = FuturesUnordered::new();
             for epoch in delete {
@@ -438,7 +424,7 @@ impl Replica {
                 .location
                 .filename()
                 .and_then(|filename| filename.strip_suffix(".wal"))
-                .and_then(|filename| filename.parse::<u64>().ok())
+                .and_then(|filename| filename.parse::<u32>().ok())
             {
                 if epoch < latest_snapshot_epoch {
                     let path = wal.location;
@@ -457,24 +443,26 @@ impl Replica {
         Ok(())
     }
 
-    async fn get(object_store: &impl ObjectStore, path: Path) -> Result<Object> {
+    async fn get(object_store: &impl ObjectStore, path: Path) -> Result<NamedTempFile> {
         Self::get_if_exists(object_store, path)
             .await?
             .ok_or_else(|| anyhow!("Not found"))
     }
 
-    async fn get_if_exists(object_store: &impl ObjectStore, path: Path) -> Result<Option<Object>> {
+    async fn get_if_exists(
+        object_store: &impl ObjectStore,
+        path: Path,
+    ) -> Result<Option<NamedTempFile>> {
         match object_store.get(&path).await {
             Ok(get_result) => {
                 let tmp = NamedTempFile::new()?;
-                let last_modified = get_result.meta.last_modified;
                 let mut bytes = get_result.into_stream();
                 let mut file = tokio::fs::File::create(tmp.path()).await?;
                 while let Some(chunk) = bytes.next().await {
                     file.write_all(&chunk?.as_ref()).await?;
                 }
                 file.sync_data().await?;
-                Ok(Some(Object { tmp, last_modified }))
+                Ok(Some(tmp))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
@@ -506,19 +494,19 @@ impl Replica {
         Ok(())
     }
 
-    fn snapshot_path(epoch: u64) -> Path {
-        Path::from(Self::SNAPSHOT_PATH).child(format!("{:020}.db", epoch))
+    fn snapshot_path(epoch: u32) -> Path {
+        Path::from(Self::SNAPSHOT_PATH).child(format!("{:010}.db", epoch))
     }
 
-    fn wal_path(epoch: u64) -> Path {
-        Path::from(Self::WAL_PATH).child(format!("{:020}.wal", epoch))
+    fn wal_path(epoch: u32) -> Path {
+        Path::from(Self::WAL_PATH).child(format!("{:010}.wal", epoch))
     }
 
-    async fn latest_snapshot_epoch(object_store: &impl ObjectStore) -> Result<u64> {
+    async fn latest_snapshot_epoch(object_store: &impl ObjectStore) -> Result<u32> {
         Self::latest_epoch(object_store, &Path::from(Self::SNAPSHOT_PATH), ".db").await
     }
 
-    async fn latest_wal_epoch(object_store: &impl ObjectStore) -> Result<u64> {
+    async fn latest_wal_epoch(object_store: &impl ObjectStore) -> Result<u32> {
         Self::latest_epoch(object_store, &Path::from(Self::WAL_PATH), ".wal").await
     }
 
@@ -526,9 +514,9 @@ impl Replica {
         object_store: &impl ObjectStore,
         path: &Path,
         suffix: &str,
-    ) -> Result<u64> {
+    ) -> Result<u32> {
         let mut items = object_store.list(Some(&path));
-        let mut current_epoch: Option<u64> = None;
+        let mut current_epoch: Option<u32> = None;
         while let Some(manifest) = match items.next().await.transpose() {
             Ok(file) => file,
             Err(e) => bail!("Failed to list objects: {}", e),

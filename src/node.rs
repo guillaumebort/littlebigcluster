@@ -10,6 +10,7 @@ use anyhow::Result;
 use axum::Router;
 use chrono::Utc;
 use object_store::ObjectStore;
+use sqlx::{Executor, Sqlite};
 use tokio::{
     select,
     sync::{watch, Notify, RwLock},
@@ -19,7 +20,7 @@ use tracing::{debug, error, trace};
 use uuid::Uuid;
 
 use crate::{
-    db::{ReadDB, WriteDB, DB},
+    db::DB,
     replica::Replica,
     server::{LeaderState, Server},
 };
@@ -46,7 +47,7 @@ impl Node {
 
 // ===== Follower =====
 
-pub trait Follower: ReadDB {
+pub trait Follower {
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>>;
 }
 
@@ -100,12 +101,8 @@ impl FollowerNode {
         }
         Ok(())
     }
-}
 
-impl Deref for FollowerNode {
-    type Target = DB;
-
-    fn deref(&self) -> &Self::Target {
+    pub async fn db(&self) -> &DB {
         &self.db
     }
 }
@@ -118,7 +115,7 @@ impl Follower for FollowerNode {
 
 // ===== Leader =====
 
-pub trait Leader: ReadDB + WriteDB {
+pub trait Leader {
     fn shutdown(self) -> impl Future<Output = Result<()>>;
 
     fn lost_leadership(&self) -> impl Future<Output = ()>;
@@ -126,7 +123,7 @@ pub trait Leader: ReadDB + WriteDB {
     fn address(&self) -> SocketAddr;
 }
 
-pub trait StandByLeader: ReadDB {
+pub trait StandByLeader {
     fn wait_for_leadership(self) -> impl Future<Output = Result<impl Leader>>;
 }
 
@@ -180,7 +177,8 @@ impl LeaderNode {
         let replica = Arc::new(RwLock::new(replica));
 
         // Start the server
-        let server = Server::start(&mut node, router, leader_status.clone(), db.clone()).await?;
+        let server =
+            Server::start(&mut node, router, leader_status.clone(), replica.clone()).await?;
 
         // drop guard so we stop everything when the leader is dropped
         let cancel = CancellationToken::new().drop_guard();
@@ -221,14 +219,6 @@ impl LeaderNode {
     }
 }
 
-impl Deref for LeaderNode {
-    type Target = DB;
-
-    fn deref(&self) -> &Self::Target {
-        &self.db
-    }
-}
-
 impl StandByLeader for LeaderNode {
     async fn wait_for_leadership(mut self) -> Result<impl Leader> {
         debug!("Waiting for leadership...");
@@ -239,7 +229,7 @@ impl StandByLeader for LeaderNode {
 
             // Check current leader
             let current_leader = replica.leader().await?;
-            let last_update = replica.last_update();
+            let last_update = replica.last_update().await?;
 
             // If there is no leader OR the leader is stale
             if current_leader.is_none()
@@ -276,6 +266,8 @@ impl StandByLeader for LeaderNode {
                     }
                 }
             }
+            drop(replica);
+
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
@@ -291,6 +283,8 @@ impl Leader for LeaderNode {
 
         // Release leadership
         loop {
+            // replica copies are owned by 1) the keep-alive task and 2) the server
+            // so when both are shutdown, we should be the only one holding a replica copy
             match Arc::try_unwrap(self.replica) {
                 Ok(replica) => {
                     let mut replica = replica.into_inner();
