@@ -17,7 +17,10 @@ use futures::{future::BoxFuture, FutureExt};
 use parking_lot::Mutex;
 use rusqlite::{types::FromSql, Connection, DatabaseName, OpenFlags, Params, Transaction};
 use tempfile::{NamedTempFile, TempDir};
-use tokio::{runtime::Handle, sync::oneshot, sync::SemaphorePermit};
+use tokio::{
+    runtime::Handle,
+    sync::{oneshot, SemaphorePermit},
+};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::debug;
 
@@ -86,7 +89,6 @@ impl DB {
         debug!(?db_path, ?snapshot, "Opening DB");
         // restore snapshot or create empty db
         if let Some(snapshot) = snapshot {
-            std::fs::copy(snapshot, "/tmp/wat")?;
             std::fs::copy(snapshot, &db_path)?;
         } else {
             // create empty db

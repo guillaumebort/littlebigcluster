@@ -13,8 +13,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
-use crate::db::{ReadDB, WriteDB};
-use crate::{db::DB, Node};
+use crate::{
+    db::{ReadDB, WriteDB, DB},
+    Node,
+};
 
 const SNAPSHOT_INTERVAL: u64 = 30;
 const KEEP_SNAPSHOTS: usize = 10;

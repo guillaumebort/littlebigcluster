@@ -1,20 +1,28 @@
-use std::ops::Deref;
-use std::sync::atomic::AtomicBool;
-use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    ops::Deref,
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 use anyhow::Result;
 use axum::Router;
 use chrono::Utc;
 use object_store::ObjectStore;
-use tokio::select;
-use tokio::sync::{watch, Notify, RwLock};
+use tokio::{
+    select,
+    sync::{watch, Notify, RwLock},
+};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
-use crate::db::{ReadDB, WriteDB, DB};
-use crate::replica::Replica;
-use crate::server::{LeaderState, Server};
+use crate::{
+    db::{ReadDB, WriteDB, DB},
+    replica::Replica,
+    server::{LeaderState, Server},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
