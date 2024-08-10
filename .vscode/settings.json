@@ -7,4 +7,8 @@
     "+nightly"
   ],
   "rust-analyzer.imports.granularity.enforce": true,
+  "errorLens.messageTemplate": "",
+  "errorLens.enabledDiagnosticLevels": [
+    "error",
+  ],
 }

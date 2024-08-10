@@ -1,10 +1,16 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 
 use anyhow::Result;
+use axum::{
+    body::Body,
+    extract::{Query, Request},
+    Json,
+};
 use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
-use litecluster::{Follower, Leader, LiteCluster, StandByLeader};
+use litecluster::{Follower, JsonResponse, Leader, LiteCluster, StandByLeader};
 use object_store::local::LocalFileSystem;
+use serde_json::json;
 use tracing::{error, info, level_filters::LevelFilter, warn, Level};
 use tracing_subscriber::{
     filter,
@@ -134,7 +140,20 @@ pub async fn main() {
 }
 
 async fn leader(cluster: LiteCluster, az: String, address: SocketAddr) -> Result<()> {
-    let router = axum::Router::new().route("/", axum::routing::get(|| async { "LOL" }));
+    async fn hello(Query(params): Query<HashMap<String, String>>) -> JsonResponse {
+        let name = params
+            .get("name")
+            .ok_or_else(|| anyhow::anyhow!("name is required"))?;
+        let count = params
+            .get("count")
+            .ok_or_else(|| anyhow::anyhow!("count is required"))?;
+        info!(?name, ?count, "Received Hello request");
+        Ok(Json(json!({
+            "message": format!("Hello, {}!", name),
+        })))
+    }
+
+    let router = axum::Router::new().route("/hello", axum::routing::get(hello));
     info!("Joining cluster as leader...");
     let node = cluster.join_as_leader(az, address, router).await?;
     info!("Joined cluster! Waiting for leadership...");
@@ -166,12 +185,27 @@ async fn follower(cluster: LiteCluster, az: String) -> Result<()> {
     let leader = watch_leader.borrow_and_update().clone();
     info!(?leader, "Leader is");
 
+    let mut count = 0;
     loop {
         select! {
             _ = watch_leader.changed().fuse() => {
                 let leader = watch_leader.borrow_and_update().clone();
                 info!(?leader, "Leader changed");
             }
+
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)).fuse() => {
+                count += 1;
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/hello?name={}&count={}", node.uuid().to_string(), count))
+                    .header("X-Custom-Foo", "Bar")
+                    .body(Body::empty())?;
+                match node.leader_client().request(req).await {
+                    Ok(res) => info!(status = ?res.status(), count, "Ok"),
+                    Err(err) => error!(?err, count, "Error contacting leader"),
+                }
+            }
+
             _ = wait_exit_signal().fuse() => {
                 info!("Exiting...");
                 break;

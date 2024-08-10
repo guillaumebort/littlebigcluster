@@ -15,7 +15,7 @@ use futures::{future::BoxFuture, FutureExt};
 use sqlx::{
     pool::PoolConnection,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteQueryResult},
-    ConnectOptions, Connection, Executor, Sqlite, SqliteConnection, SqlitePool, Transaction,
+    ConnectOptions, Connection, Sqlite, SqliteConnection, SqlitePool, Transaction,
 };
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{runtime::Handle, sync::oneshot};
@@ -59,7 +59,7 @@ where
 }
 
 #[derive(Clone)]
-pub struct DB {
+pub(crate) struct DB {
     db_path: PathBuf,
     read_pool: SqlitePool,
     write_conn: Arc<tokio::sync::Mutex<(SqliteConnection, Vec<DoAck>)>>,
@@ -124,6 +124,10 @@ impl DB {
         })
     }
 
+    pub fn read_pool(&self) -> &SqlitePool {
+        &self.read_pool
+    }
+
     pub fn path(&self) -> &Path {
         &self.db_path
     }
@@ -142,47 +146,6 @@ impl DB {
 
     fn shm_path(&self) -> PathBuf {
         PathBuf::from(format!("{}-shm", self.db_path.display()))
-    }
-
-    pub async fn transaction<A, E>(
-        &self,
-        thunk: impl for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>,
-    ) -> Result<Ack<A>>
-    where
-        A: Send + Unpin + 'static,
-        E: Into<anyhow::Error> + Send,
-    {
-        let (ref mut conn, ref mut pending_acks) = *self.write_conn.lock().await;
-        let txn = conn.begin().await?;
-        let result = match thunk(txn).await {
-            Ok(result) => Some(result),
-            Err(e) => bail!(e.into()),
-        };
-        let (do_ack, ack) = tokio::sync::oneshot::channel();
-        pending_acks.push(do_ack);
-        Ok(Ack { result, ack })
-    }
-
-    pub async fn execute<'a>(
-        &self,
-        query: sqlx::query::Query<'a, Sqlite, <Sqlite as sqlx::Database>::Arguments<'a>>,
-    ) -> Result<Ack<SqliteQueryResult>> {
-        let (ref mut conn, ref mut pending_acks) = *self.write_conn.lock().await;
-        let result = Some(query.execute(&mut *conn).await?);
-        let (do_ack, ack) = tokio::sync::oneshot::channel();
-        pending_acks.push(do_ack);
-        Ok(Ack { result, ack })
-    }
-
-    pub async fn execute_batch<'a>(
-        &self,
-        query: sqlx::RawSql<'a>,
-    ) -> Result<Ack<SqliteQueryResult>> {
-        let (ref mut conn, ref mut pending_acks) = *self.write_conn.lock().await;
-        let result = Some(query.execute(&mut *conn).await?);
-        let (do_ack, ack) = tokio::sync::oneshot::channel();
-        pending_acks.push(do_ack);
-        Ok(Ack { result, ack })
     }
 
     pub(crate) async fn checkpoint<A>(
@@ -396,67 +359,46 @@ impl DB {
 
         Ok(())
     }
-}
 
-impl<'c> Executor<'c> for &DB {
-    type Database = Sqlite;
-
-    fn fetch_many<'e, 'q: 'e, E>(
-        self,
-        query: E,
-    ) -> futures::stream::BoxStream<
-        'e,
-        std::result::Result<
-            sqlx::Either<
-                <Self::Database as sqlx::Database>::QueryResult,
-                <Self::Database as sqlx::Database>::Row,
-            >,
-            sqlx::Error,
-        >,
-    >
+    pub async fn transaction<A, E>(
+        &self,
+        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
+    ) -> Result<Ack<A>>
     where
-        'c: 'e,
-        E: 'q + sqlx::Execute<'q, Self::Database>,
+        A: Send + Unpin + 'static,
+        E: Into<anyhow::Error> + Send,
     {
-        self.read_pool.fetch_many(query)
+        let (ref mut conn, ref mut pending_acks) = *self.write_conn.lock().await;
+        let txn = conn.begin().await?;
+        let result = match thunk(txn).await {
+            Ok(result) => Some(result),
+            Err(e) => bail!(e.into()),
+        };
+        let (do_ack, ack) = tokio::sync::oneshot::channel();
+        pending_acks.push(do_ack);
+        Ok(Ack { result, ack })
     }
 
-    fn fetch_optional<'e, 'q: 'e, E>(
-        self,
-        query: E,
-    ) -> BoxFuture<
-        'e,
-        std::result::Result<Option<<Self::Database as sqlx::Database>::Row>, sqlx::Error>,
-    >
-    where
-        'c: 'e,
-        E: 'q + sqlx::Execute<'q, Self::Database>,
-    {
-        self.read_pool.fetch_optional(query)
+    pub async fn execute<'a>(
+        &'a self,
+        query: sqlx::query::Query<'a, Sqlite, <Sqlite as sqlx::Database>::Arguments<'a>>,
+    ) -> Result<Ack<SqliteQueryResult>> {
+        let (ref mut conn, ref mut pending_acks) = *self.write_conn.lock().await;
+        let result = Some(query.execute(&mut *conn).await?);
+        let (do_ack, ack) = tokio::sync::oneshot::channel();
+        pending_acks.push(do_ack);
+        Ok(Ack { result, ack })
     }
 
-    fn prepare_with<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-        parameters: &'e [<Self::Database as sqlx::Database>::TypeInfo],
-    ) -> BoxFuture<
-        'e,
-        std::result::Result<<Self::Database as sqlx::Database>::Statement<'q>, sqlx::Error>,
-    >
-    where
-        'c: 'e,
-    {
-        self.read_pool.prepare_with(sql, parameters)
-    }
-
-    fn describe<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-    ) -> BoxFuture<'e, std::result::Result<sqlx::Describe<Self::Database>, sqlx::Error>>
-    where
-        'c: 'e,
-    {
-        self.read_pool.describe(sql)
+    pub async fn execute_batch(
+        &self,
+        query: sqlx::RawSql<'static>,
+    ) -> Result<Ack<SqliteQueryResult>> {
+        let (ref mut conn, ref mut pending_acks) = *self.write_conn.lock().await;
+        let result = Some(query.execute(&mut *conn).await?);
+        let (do_ack, ack) = tokio::sync::oneshot::channel();
+        pending_acks.push(do_ack);
+        Ok(Ack { result, ack })
     }
 }
 
@@ -476,7 +418,9 @@ mod tests {
     #[tokio::test]
     async fn open_and_query() -> Result<()> {
         let db = DB::open(None).await?;
-        let one: i64 = sqlx::query_scalar("select 1").fetch_one(&db).await?;
+        let one: i64 = sqlx::query_scalar("select 1")
+            .fetch_one(&db.read_pool)
+            .await?;
         assert_eq!(1, one);
         Ok(())
     }
@@ -484,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn open_and_insert() -> Result<()> {
         let db = DB::open(None).await?;
-        let _ = db
+        let _ = &db
             .execute_batch(sqlx::raw_sql(
                 r#"
                 CREATE TABLE batchs(uuid);
@@ -494,7 +438,7 @@ mod tests {
             .await?;
 
         let uuid: String = sqlx::query_scalar("select * from batchs")
-            .fetch_one(&db)
+            .fetch_one(&db.read_pool)
             .await?;
 
         assert_eq!("0191b6d0-3d9a-7eb1-88b8-5312737f2ca0", uuid);
@@ -506,7 +450,7 @@ mod tests {
     async fn write_in_readonly_pool() -> Result<()> {
         let db = DB::open(None).await?;
         assert!(sqlx::query("create table lol(id);")
-            .execute(&db)
+            .execute(&db.read_pool)
             .await
             .is_err());
 
@@ -522,7 +466,7 @@ mod tests {
         // the pool is blocked, the call will timeout
         assert!(tokio::time::timeout(
             Duration::from_millis(100),
-            sqlx::query("create table lol(id);").execute(&db)
+            sqlx::query("select 1").execute(&db.read_pool)
         )
         .await
         .is_err());
@@ -557,7 +501,7 @@ mod tests {
         assert_eq!(
             0,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -596,7 +540,7 @@ mod tests {
         // restore the snapshot
         let db = DB::open(Some(&db_snapshot)).await?;
         let count: i32 = sqlx::query_scalar("select count(*) from batchs")
-            .fetch_one(&db)
+            .fetch_one(&db.read_pool)
             .await?;
         assert_eq!(100, count);
 
@@ -654,7 +598,7 @@ mod tests {
         assert_eq!(
             0,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -684,7 +628,7 @@ mod tests {
         assert_eq!(
             1,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -694,7 +638,7 @@ mod tests {
         assert_eq!(
             0,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -703,7 +647,7 @@ mod tests {
         assert_eq!(
             0,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -712,7 +656,7 @@ mod tests {
         assert_eq!(
             1,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -720,7 +664,7 @@ mod tests {
         assert_eq!(
             "0191b6d0-3d9a-7eb1-88b8-5312737f2ca0",
             sqlx::query_scalar::<_, String>("select* from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -757,7 +701,7 @@ mod tests {
         assert_eq!(
             1,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -770,7 +714,7 @@ mod tests {
         assert_eq!(
             0,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -785,7 +729,7 @@ mod tests {
         assert_eq!(
             1,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -815,7 +759,7 @@ mod tests {
         assert_eq!(
             2,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -830,7 +774,7 @@ mod tests {
         assert_eq!(
             1,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db)
+                .fetch_one(&db.read_pool)
                 .await?,
         );
 
@@ -974,7 +918,7 @@ mod tests {
                 let mut i = 0;
                 loop {
                     let count: i32 = sqlx::query_scalar("select count(*) from batchs")
-                        .fetch_one(&follower)
+                        .fetch_one(&follower.read_pool)
                         .await
                         .unwrap();
                     println!("follower sees {} batches", count);

@@ -1,7 +1,6 @@
 use std::{
     future::Future,
     net::SocketAddr,
-    ops::Deref,
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
@@ -20,6 +19,7 @@ use tracing::{debug, error, trace};
 use uuid::Uuid;
 
 use crate::{
+    client::Client,
     db::DB,
     replica::Replica,
     server::{LeaderState, Server},
@@ -49,12 +49,20 @@ impl Node {
 
 pub trait Follower {
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>>;
+
+    fn db(&self) -> impl Executor<Database = Sqlite>;
+
+    fn leader_client(&self) -> &Client;
+
+    fn uuid(&self) -> Uuid;
 }
 
 #[derive(Debug)]
 pub struct FollowerNode {
+    node: Node,
     db: DB,
     watch_leader_node: watch::Receiver<Option<Node>>,
+    client: Client,
     #[allow(unused)]
     cancel: DropGuard,
 }
@@ -70,15 +78,20 @@ impl FollowerNode {
         let db = replica.owned_db();
 
         // Create a watch for the leader node
-        let (tx, rx) = watch::channel(replica.leader().await?);
+        let (leader_updates, watch_leader_node) = watch::channel(replica.leader().await?);
 
         // Keep the replica up-to-date until the follower is dropped
         let cancel = CancellationToken::new();
-        tokio::spawn(Self::follow(replica, tx, cancel.child_token()));
+        tokio::spawn(Self::follow(replica, leader_updates, cancel.child_token()));
+
+        // Startup a client connected to the leader
+        let client = Client::new(watch_leader_node.clone());
 
         Ok(Self {
+            node,
             db,
-            watch_leader_node: rx,
+            watch_leader_node,
+            client,
             cancel: cancel.drop_guard(),
         })
     }
@@ -101,15 +114,23 @@ impl FollowerNode {
         }
         Ok(())
     }
-
-    pub async fn db(&self) -> &DB {
-        &self.db
-    }
 }
 
 impl Follower for FollowerNode {
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>> {
         &self.watch_leader_node
+    }
+
+    fn db(&self) -> impl Executor<Database = Sqlite> {
+        self.db.read_pool()
+    }
+
+    fn leader_client(&self) -> &Client {
+        &self.client
+    }
+
+    fn uuid(&self) -> Uuid {
+        self.node.uuid
     }
 }
 
@@ -121,10 +142,14 @@ pub trait Leader {
     fn lost_leadership(&self) -> impl Future<Output = ()>;
 
     fn address(&self) -> SocketAddr;
+
+    fn db(&self) -> impl Executor<Database = Sqlite>;
 }
 
 pub trait StandByLeader {
     fn wait_for_leadership(self) -> impl Future<Output = Result<impl Leader>>;
+
+    fn db(&self) -> impl Executor<Database = Sqlite>;
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +296,10 @@ impl StandByLeader for LeaderNode {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
+
+    fn db(&self) -> impl Executor<Database = Sqlite> {
+        self.db.read_pool()
+    }
 }
 
 impl Leader for LeaderNode {
@@ -312,5 +341,9 @@ impl Leader for LeaderNode {
 
     fn address(&self) -> SocketAddr {
         self.server.address
+    }
+
+    fn db(&self) -> impl Executor<Database = Sqlite> {
+        self.db.read_pool()
     }
 }

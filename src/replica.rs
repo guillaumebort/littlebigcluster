@@ -42,7 +42,7 @@ impl Replica {
         // verify cluster ID
         let db_cluster_id: String =
             sqlx::query_scalar(r#"SELECT value FROM litecluster WHERE key = 'cluster_id'"#)
-                .fetch_one(&db)
+                .fetch_one(db.read_pool())
                 .await?;
 
         if db_cluster_id != cluster_id {
@@ -143,6 +143,10 @@ impl Replica {
         self.epoch
     }
 
+    pub fn snapshot_epoch(&self) -> u32 {
+        self.snapshot_epoch
+    }
+
     pub fn owned_db(&self) -> DB {
         self.db.clone()
     }
@@ -150,7 +154,7 @@ impl Replica {
     pub async fn last_update(&self) -> Result<DateTime<Utc>> {
         let last_update: String =
             sqlx::query_scalar(r#"SELECT value FROM litecluster WHERE key = 'last_update'"#)
-                .fetch_one(&self.db)
+                .fetch_one(self.db.read_pool())
                 .await?;
         Ok(DateTime::parse_from_rfc3339(&last_update)
             .context("cannot parse `last_update` date")?
@@ -172,7 +176,7 @@ impl Replica {
                 (SELECT value AS cluster_id FROM litecluster WHERE key = 'cluster_id')
             "#,
         )
-        .fetch_optional(&self.db)
+        .fetch_optional(self.db.read_pool())
         .await?;
         Ok(if let Some((uuid, az, address, cluster_id)) = maybe_node {
             Some(Node {

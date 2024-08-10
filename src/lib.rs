@@ -1,3 +1,4 @@
+mod client;
 mod db;
 mod node;
 mod replica;
@@ -11,7 +12,7 @@ pub use node::{Follower, Leader, Node, StandByLeader};
 use node::{FollowerNode, LeaderNode};
 use object_store::ObjectStore;
 use replica::Replica;
-pub use server::LeaderState;
+pub use server::{JsonResponse, LeaderState};
 
 pub struct LiteCluster {
     cluster_id: String,
