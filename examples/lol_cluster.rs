@@ -8,12 +8,11 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
-use litecluster::{Follower, JsonResponse, Leader, LiteCluster, StandByLeader};
+use littlebigcluster::{Follower, JsonResponse, Leader, LittleBigCluster, StandByLeader};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
-use tracing::{error, info, level_filters::LevelFilter, warn, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::{
-    filter,
     layer::{Layer, SubscriberExt},
     util::SubscriberInitExt,
 };
@@ -139,7 +138,7 @@ pub async fn main() {
     }
 }
 
-async fn leader(cluster: LiteCluster, az: String, address: SocketAddr) -> Result<()> {
+async fn leader(cluster: LittleBigCluster, az: String, address: SocketAddr) -> Result<()> {
     async fn hello(Query(params): Query<HashMap<String, String>>) -> JsonResponse {
         let name = params
             .get("name")
@@ -176,7 +175,7 @@ async fn leader(cluster: LiteCluster, az: String, address: SocketAddr) -> Result
     Ok(())
 }
 
-async fn follower(cluster: LiteCluster, az: String) -> Result<()> {
+async fn follower(cluster: LittleBigCluster, az: String) -> Result<()> {
     info!("Joining cluster as follower...");
     let node = cluster.join_as_follower(az).await?;
     info!("Joined cluster!");
@@ -216,11 +215,11 @@ async fn follower(cluster: LiteCluster, az: String) -> Result<()> {
     Ok(())
 }
 
-fn open_cluster(cluster_id: &str, path: &std::path::Path) -> Result<LiteCluster> {
-    LiteCluster::at(cluster_id, LocalFileSystem::new_with_prefix(path)?)
+fn open_cluster(cluster_id: &str, path: &std::path::Path) -> Result<LittleBigCluster> {
+    LittleBigCluster::at(cluster_id, LocalFileSystem::new_with_prefix(path)?)
 }
 
-async fn init_cluster(cluster: &LiteCluster) -> Result<()> {
+async fn init_cluster(cluster: &LittleBigCluster) -> Result<()> {
     cluster.init().await
 }
 

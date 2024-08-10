@@ -27,8 +27,8 @@ pub(crate) struct Replica {
 }
 
 impl Replica {
-    pub const SNAPSHOT_PATH: &'static str = "/snapshots";
-    pub const WAL_PATH: &'static str = "/wal";
+    pub const SNAPSHOT_PATH: &'static str = "/_lbc/snapshots";
+    pub const WAL_PATH: &'static str = "/_lbc/wal";
 
     pub async fn open(cluster_id: &str, object_store: Arc<dyn ObjectStore>) -> Result<Self> {
         // Find latest snapshot
@@ -41,7 +41,7 @@ impl Replica {
 
         // verify cluster ID
         let db_cluster_id: String =
-            sqlx::query_scalar(r#"SELECT value FROM litecluster WHERE key = 'cluster_id'"#)
+            sqlx::query_scalar(r#"SELECT value FROM _lbc WHERE key = 'cluster_id'"#)
                 .fetch_one(db.read_pool())
                 .await?;
 
@@ -95,17 +95,17 @@ impl Replica {
             let ack = db
                 .transaction(|mut txn| {
                     async move {
-                        sqlx::query(r#"CREATE TABLE litecluster (key TEXT PRIMARY KEY, value ANY)"#)
+                        sqlx::query(r#"CREATE TABLE _lbc (key TEXT PRIMARY KEY, value ANY)"#)
                             .execute(&mut *txn)
                             .await?;
-                        sqlx::query(r#"INSERT INTO litecluster VALUES ('cluster_id', ?1)"#)
+                        sqlx::query(r#"INSERT INTO _lbc VALUES ('cluster_id', ?1)"#)
                             .bind(cluster_id)
                             .execute(&mut *txn)
                             .await?;
-                        sqlx::query(r#"INSERT INTO litecluster VALUES ('epoch', 0)"#)
+                        sqlx::query(r#"INSERT INTO _lbc VALUES ('epoch', 0)"#)
                             .execute(&mut *txn)
                             .await?;
-                        sqlx::query(r#"INSERT INTO litecluster VALUES ('last_update', ?1)"#)
+                        sqlx::query(r#"INSERT INTO _lbc VALUES ('last_update', ?1)"#)
                             .bind(Utc::now().to_rfc3339())
                             .execute(&mut *txn)
                             .await?;
@@ -153,7 +153,7 @@ impl Replica {
 
     pub async fn last_update(&self) -> Result<DateTime<Utc>> {
         let last_update: String =
-            sqlx::query_scalar(r#"SELECT value FROM litecluster WHERE key = 'last_update'"#)
+            sqlx::query_scalar(r#"SELECT value FROM _lbc WHERE key = 'last_update'"#)
                 .fetch_one(self.db.read_pool())
                 .await?;
         Ok(DateTime::parse_from_rfc3339(&last_update)
@@ -170,10 +170,10 @@ impl Replica {
                     json_extract(value, '$.uuid') AS uuid,
                     json_extract(value, '$.az') AS az,
                     json_extract(value, '$.address') AS address
-                FROM litecluster
+                FROM _lbc
                 WHERE key = 'leader')
                 JOIN
-                (SELECT value AS cluster_id FROM litecluster WHERE key = 'cluster_id')
+                (SELECT value AS cluster_id FROM _lbc WHERE key = 'cluster_id')
             "#,
         )
         .fetch_optional(self.db.read_pool())
@@ -206,11 +206,11 @@ impl Replica {
             .db
             .transaction(move |mut txn| {
                 async move {
-                    sqlx::query(r#"UPDATE litecluster SET value=?1 WHERE key = 'epoch'"#)
+                    sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'epoch'"#)
                         .bind(next_epoch)
                         .execute(&mut *txn)
                         .await?;
-                    sqlx::query(r#"UPDATE litecluster SET value=?1 WHERE key = 'last_update'"#)
+                    sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'last_update'"#)
                         .bind(Utc::now().to_rfc3339())
                         .execute(&mut *txn)
                         .await?;
@@ -291,7 +291,7 @@ impl Replica {
             if let Some(leader) = new_leader {
                 sqlx::query(
                     r#"
-                    INSERT INTO litecluster VALUES('leader', json_object('uuid', ?1, 'address', ?2, 'az', ?3))
+                    INSERT INTO _lbc VALUES('leader', json_object('uuid', ?1, 'address', ?2, 'az', ?3))
                     ON CONFLICT DO UPDATE SET value=json_object('uuid', ?1, 'address', ?2, 'az', ?3)
                     "#,
                 )
@@ -302,11 +302,11 @@ impl Replica {
                 )
                 .bind(leader.az).execute(&mut *txn).await?;
             } else {
-                sqlx::query(r#"DELETE FROM litecluster WHERE key = 'leader'"#).execute(&mut *txn).await?;
+                sqlx::query(r#"DELETE FROM _lbc WHERE key = 'leader'"#).execute(&mut *txn).await?;
             }
 
-            sqlx::query(r#"UPDATE litecluster SET value=?1 WHERE key = 'epoch'"#).bind(next_epoch).execute(&mut *txn).await?;
-            sqlx::query(r#"UPDATE litecluster SET value=?1 WHERE key = 'last_update'"#).bind(Utc::now().to_rfc3339()).execute(&mut *txn).await?;
+            sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'epoch'"#).bind(next_epoch).execute(&mut *txn).await?;
+            sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'last_update'"#).bind(Utc::now().to_rfc3339()).execute(&mut *txn).await?;
 
             txn.commit().await
         }.boxed()).await?;

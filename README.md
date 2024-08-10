@@ -1,4 +1,4 @@
-# litecluster
+# littlebigcluster
 
 An experimental Rust library designed for building clustered applications with a simple leader-follower architecture. This is a work in progress and in its early stages of development, aimed at exploring clustered applications that rely on external object stores for state management.
 

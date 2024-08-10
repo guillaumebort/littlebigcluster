@@ -14,12 +14,12 @@ use object_store::ObjectStore;
 use replica::Replica;
 pub use server::{JsonResponse, LeaderState};
 
-pub struct LiteCluster {
+pub struct LittleBigCluster {
     cluster_id: String,
     object_store: Arc<dyn ObjectStore>,
 }
 
-impl LiteCluster {
+impl LittleBigCluster {
     pub fn at(cluster_id: impl Into<String>, object_store: impl ObjectStore) -> Result<Self> {
         let cluster_id = cluster_id.into();
         let object_store = Arc::new(object_store);

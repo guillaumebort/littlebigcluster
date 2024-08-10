@@ -82,7 +82,7 @@ impl DB {
         // to deliver the acks signals
         let pending_acks = Vec::with_capacity(1_024);
 
-        let db_path = tmp.path().join("litecluster.db");
+        let db_path = tmp.path().join("lbc.db");
         debug!(?db_path, ?snapshot, "Opening DB");
 
         // restore snapshot or create empty db

@@ -25,6 +25,7 @@ use crate::Node;
 #[derive(Debug)]
 pub struct Client {
     sender: Arc<Mutex<Option<SendRequest<Body>>>>,
+    #[allow(unused)]
     cancel: DropGuard,
 }
 
