@@ -12,14 +12,12 @@ use object_store::ObjectStore;
 use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, Transaction};
 use tokio::{
     select,
-    sync::{watch, Notify, RwLock},
+    sync::{Notify, RwLock},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
-use uuid::Uuid;
 
 use crate::{
-    client::LeaderClient,
     config::Config,
     db::{Ack, DB},
     replica::Replica,
