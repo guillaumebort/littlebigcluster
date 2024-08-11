@@ -2,14 +2,14 @@ use std::{
     future::Future,
     net::SocketAddr,
     sync::{atomic::AtomicBool, Arc},
-    time::Duration,
 };
 
 use anyhow::Result;
 use axum::Router;
 use chrono::Utc;
+use futures::future::BoxFuture;
 use object_store::ObjectStore;
-use sqlx::{Executor, Sqlite};
+use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, Transaction};
 use tokio::{
     select,
     sync::{watch, Notify, RwLock},
@@ -19,122 +19,13 @@ use tracing::{debug, error, trace};
 use uuid::Uuid;
 
 use crate::{
-    client::Client,
-    db::DB,
+    client::LeaderClient,
+    config::Config,
+    db::{Ack, DB},
     replica::Replica,
     server::{LeaderState, Server},
+    Node,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Node {
-    pub uuid: Uuid,
-    pub cluster_id: String,
-    pub az: String,
-    pub address: Option<SocketAddr>,
-}
-
-impl Node {
-    pub fn new(cluster_id: String, az: String, address: Option<SocketAddr>) -> Self {
-        let uuid = Uuid::now_v7();
-        Self {
-            uuid,
-            cluster_id,
-            az,
-            address,
-        }
-    }
-}
-
-// ===== Follower =====
-
-pub trait Follower {
-    fn watch_leader(&self) -> &watch::Receiver<Option<Node>>;
-
-    fn db(&self) -> impl Executor<Database = Sqlite>;
-
-    fn leader_client(&self) -> &Client;
-
-    fn uuid(&self) -> Uuid;
-}
-
-#[derive(Debug)]
-pub struct FollowerNode {
-    node: Node,
-    db: DB,
-    watch_leader_node: watch::Receiver<Option<Node>>,
-    client: Client,
-    #[allow(unused)]
-    cancel: DropGuard,
-}
-
-impl FollowerNode {
-    pub async fn join(node: Node, object_store: Arc<dyn ObjectStore>) -> Result<Self> {
-        debug!(?node, "Joining cluster as follower");
-
-        // Open the replica
-        let replica = Replica::open(&node.cluster_id, object_store).await?;
-
-        // Get a (read-only) DB
-        let db = replica.owned_db();
-
-        // Create a watch for the leader node
-        let (leader_updates, watch_leader_node) = watch::channel(replica.leader().await?);
-
-        // Keep the replica up-to-date until the follower is dropped
-        let cancel = CancellationToken::new();
-        tokio::spawn(Self::follow(replica, leader_updates, cancel.child_token()));
-
-        // Startup a client connected to the leader
-        let client = Client::new(watch_leader_node.clone());
-
-        Ok(Self {
-            node,
-            db,
-            watch_leader_node,
-            client,
-            cancel: cancel.drop_guard(),
-        })
-    }
-
-    async fn follow(
-        mut replica: Replica,
-        tx: watch::Sender<Option<Node>>,
-        cancel: CancellationToken,
-    ) -> Result<()> {
-        while !cancel.is_cancelled() {
-            replica.refresh().await?;
-
-            // Notify the leader change
-            let current_leader = replica.leader().await?;
-            if current_leader != *tx.borrow() {
-                debug!(?current_leader, "Leader changed");
-                tx.send(current_leader.clone()).ok();
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        Ok(())
-    }
-}
-
-impl Follower for FollowerNode {
-    fn watch_leader(&self) -> &watch::Receiver<Option<Node>> {
-        &self.watch_leader_node
-    }
-
-    fn db(&self) -> impl Executor<Database = Sqlite> {
-        self.db.read_pool()
-    }
-
-    fn leader_client(&self) -> &Client {
-        &self.client
-    }
-
-    fn uuid(&self) -> Uuid {
-        self.node.uuid
-    }
-}
-
-// ===== Leader =====
 
 pub trait Leader {
     fn shutdown(self) -> impl Future<Output = Result<()>>;
@@ -144,12 +35,34 @@ pub trait Leader {
     fn address(&self) -> SocketAddr;
 
     fn db(&self) -> impl Executor<Database = Sqlite>;
+
+    fn transaction<A, E>(
+        &self,
+        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
+    ) -> impl Future<Output = Result<Ack<A>>>
+    where
+        A: Send + Unpin + 'static,
+        E: Into<anyhow::Error> + Send;
+
+    fn execute<'a>(
+        &'a self,
+        query: sqlx::query::Query<'a, Sqlite, <Sqlite as sqlx::Database>::Arguments<'a>>,
+    ) -> impl Future<Output = Result<Ack<SqliteQueryResult>>>;
+
+    fn execute_batch(
+        &self,
+        query: sqlx::RawSql<'static>,
+    ) -> impl Future<Output = Result<Ack<SqliteQueryResult>>>;
+
+    fn object_store(&self) -> &Arc<dyn ObjectStore>;
 }
 
 pub trait StandByLeader {
     fn wait_for_leadership(self) -> impl Future<Output = Result<impl Leader>>;
 
     fn db(&self) -> impl Executor<Database = Sqlite>;
+
+    fn object_store(&self) -> &Arc<dyn ObjectStore>;
 }
 
 #[derive(Clone, Debug)]
@@ -182,8 +95,10 @@ pub struct LeaderNode {
     node: Node,
     replica: Arc<RwLock<Replica>>,
     db: DB,
+    object_store: Arc<dyn ObjectStore>,
     server: Server,
     leader_status: LeaderStatus,
+    config: Config,
     cancel: DropGuard,
 }
 
@@ -192,12 +107,13 @@ impl LeaderNode {
         mut node: Node,
         router: Router<LeaderState>,
         object_store: Arc<dyn ObjectStore>,
+        config: Config,
     ) -> Result<Self> {
         debug!(?node, "Joining cluster as Leader");
         let leader_status = LeaderStatus::new();
 
         // Open the replica
-        let replica = Replica::open(&node.cluster_id, object_store).await?;
+        let replica = Replica::open(&node.cluster_id, object_store.clone(), config.clone()).await?;
         let db: DB = replica.owned_db();
         let replica = Arc::new(RwLock::new(replica));
 
@@ -212,8 +128,10 @@ impl LeaderNode {
             node,
             replica,
             db,
+            object_store,
             server,
             leader_status,
+            config,
             cancel,
         })
     }
@@ -221,11 +139,12 @@ impl LeaderNode {
     async fn keep_alive(
         is_leader: LeaderStatus,
         replica: Arc<RwLock<Replica>>,
+        config: Config,
         cancel: CancellationToken,
     ) {
         while !cancel.is_cancelled() {
             select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                _ = tokio::time::sleep(config.epoch_interval) => {
                     match replica.write().await.incr_epoch().await {
                         Ok(epoch) => {
                             trace!(epoch, "Replica epoch incremented");
@@ -279,6 +198,7 @@ impl StandByLeader for LeaderNode {
                         tokio::spawn(Self::keep_alive(
                             self.leader_status.clone(),
                             self.replica.clone(),
+                            self.config.clone(),
                             cancel.child_token(),
                         ));
                         self.cancel = cancel.drop_guard();
@@ -293,12 +213,16 @@ impl StandByLeader for LeaderNode {
             }
             drop(replica);
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(self.config.epoch_interval).await;
         }
     }
 
     fn db(&self) -> impl Executor<Database = Sqlite> {
         self.db.read_pool()
+    }
+
+    fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.object_store
     }
 }
 
@@ -345,5 +269,31 @@ impl Leader for LeaderNode {
 
     fn db(&self) -> impl Executor<Database = Sqlite> {
         self.db.read_pool()
+    }
+
+    async fn transaction<A, E>(
+        &self,
+        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
+    ) -> Result<Ack<A>>
+    where
+        A: Send + Unpin + 'static,
+        E: Into<anyhow::Error> + Send,
+    {
+        self.db.transaction(thunk).await
+    }
+
+    async fn execute<'a>(
+        &'a self,
+        query: sqlx::query::Query<'a, Sqlite, <Sqlite as sqlx::Database>::Arguments<'a>>,
+    ) -> Result<Ack<SqliteQueryResult>> {
+        self.db.execute(query).await
+    }
+
+    async fn execute_batch(&self, query: sqlx::RawSql<'static>) -> Result<Ack<SqliteQueryResult>> {
+        self.db.execute_batch(query).await
+    }
+
+    fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.object_store
     }
 }

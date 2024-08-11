@@ -1,14 +1,16 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 use anyhow::Result;
 use axum::{
     body::Body,
     extract::{Query, Request},
+    response::{IntoResponse, Response},
     Json,
 };
 use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
-use littlebigcluster::{Follower, JsonResponse, Leader, LittleBigCluster, StandByLeader};
+use hyper::StatusCode;
+use littlebigcluster::{Config, Follower, Leader, LittleBigCluster, StandByLeader};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tracing::{error, info, warn, Level};
@@ -139,7 +141,9 @@ pub async fn main() {
 }
 
 async fn leader(cluster: LittleBigCluster, az: String, address: SocketAddr) -> Result<()> {
-    async fn hello(Query(params): Query<HashMap<String, String>>) -> JsonResponse {
+    async fn hello(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Result<Json<serde_json::Value>, LolServerError> {
         let name = params
             .get("name")
             .ok_or_else(|| anyhow::anyhow!("name is required"))?;
@@ -216,7 +220,15 @@ async fn follower(cluster: LittleBigCluster, az: String) -> Result<()> {
 }
 
 fn open_cluster(cluster_id: &str, path: &std::path::Path) -> Result<LittleBigCluster> {
-    LittleBigCluster::at(cluster_id, LocalFileSystem::new_with_prefix(path)?)
+    LittleBigCluster::at(
+        cluster_id,
+        LocalFileSystem::new_with_prefix(path)?,
+        Config {
+            epoch_interval: Duration::from_secs(1),
+            snapshot_interval: Duration::from_secs(30),
+            snapshots_to_keep: 5,
+        },
+    )
 }
 
 async fn init_cluster(cluster: &LittleBigCluster) -> Result<()> {
@@ -233,4 +245,26 @@ async fn wait_exit_signal() -> Result<()> {
     }
 
     Ok(())
+}
+
+struct LolServerError(anyhow::Error);
+
+impl IntoResponse for LolServerError {
+    fn into_response(self) -> Response {
+        error!(err = ?self.0, "Internal server error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": self.0.to_string() })),
+        )
+            .into_response()
+    }
+}
+
+impl<E> From<E> for LolServerError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
 }

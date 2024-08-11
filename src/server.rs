@@ -21,9 +21,8 @@ use tracing::{debug, error};
 
 use crate::{
     db::{Ack, DB},
-    node::LeaderStatus,
     replica::Replica,
-    Node,
+    LeaderStatus, Node,
 };
 
 #[derive(Debug)]
@@ -207,9 +206,9 @@ async fn status(State(state): State<LeaderState>) -> JsonResponse {
     })))
 }
 
-pub type JsonResponse = Result<Json<serde_json::Value>, ServerError>;
+type JsonResponse = Result<Json<serde_json::Value>, ServerError>;
 
-pub struct ServerError(anyhow::Error);
+struct ServerError(anyhow::Error);
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {

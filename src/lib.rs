@@ -1,6 +1,8 @@
 mod client;
+mod config;
 mod db;
-mod node;
+mod follower;
+mod leader;
 mod replica;
 mod server;
 
@@ -8,24 +10,54 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use axum::Router;
-pub use node::{Follower, Leader, Node, StandByLeader};
-use node::{FollowerNode, LeaderNode};
+pub use config::Config;
+pub use follower::Follower;
+use follower::FollowerNode;
+use leader::LeaderNode;
+pub use leader::{Leader, LeaderStatus, StandByLeader};
 use object_store::ObjectStore;
 use replica::Replica;
-pub use server::{JsonResponse, LeaderState};
+pub use server::LeaderState;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    pub uuid: Uuid,
+    pub cluster_id: String,
+    pub az: String,
+    pub address: Option<SocketAddr>,
+}
+
+impl Node {
+    pub fn new(cluster_id: String, az: String, address: Option<SocketAddr>) -> Self {
+        let uuid = Uuid::now_v7();
+        Self {
+            uuid,
+            cluster_id,
+            az,
+            address,
+        }
+    }
+}
 
 pub struct LittleBigCluster {
     cluster_id: String,
     object_store: Arc<dyn ObjectStore>,
+    config: config::Config,
 }
 
 impl LittleBigCluster {
-    pub fn at(cluster_id: impl Into<String>, object_store: impl ObjectStore) -> Result<Self> {
+    pub fn at(
+        cluster_id: impl Into<String>,
+        object_store: impl ObjectStore,
+        config: Config,
+    ) -> Result<Self> {
         let cluster_id = cluster_id.into();
         let object_store = Arc::new(object_store);
         Ok(Self {
             cluster_id,
             object_store,
+            config,
         })
     }
 
@@ -40,12 +72,12 @@ impl LittleBigCluster {
         router: Router<LeaderState>,
     ) -> Result<impl StandByLeader> {
         let node = Node::new(self.cluster_id, az, Some(address));
-        LeaderNode::join(node, router, self.object_store).await
+        LeaderNode::join(node, router, self.object_store, self.config).await
     }
 
     pub async fn join_as_follower(self, az: String) -> Result<impl Follower> {
         let node = Node::new(self.cluster_id, az, None);
-        FollowerNode::join(node, self.object_store).await
+        FollowerNode::join(node, self.object_store, self.config).await
     }
 
     pub async fn init(&self) -> Result<()> {

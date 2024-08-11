@@ -1,8 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -20,29 +16,35 @@ use tokio::{
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, warn};
 
-use crate::Node;
+use crate::{Config, Node};
 
 #[derive(Debug)]
-pub struct Client {
+pub struct LeaderClient {
     sender: Arc<Mutex<Option<SendRequest<Body>>>>,
+    config: Config,
     #[allow(unused)]
     cancel: DropGuard,
 }
 
 type Http2Connection = Connection<TokioIo<TcpStream>, Body, TokioExecutor>;
 
-impl Client {
-    pub fn new(watch_leader: watch::Receiver<Option<Node>>) -> Self {
+impl LeaderClient {
+    pub fn new(watch_leader: watch::Receiver<Option<Node>>, config: Config) -> Self {
         let cancel = CancellationToken::new();
         let sender = Arc::new(Mutex::new(None));
         tokio::spawn(Self::reconnect(
             watch_leader,
             sender.clone(),
+            config.clone(),
             cancel.child_token(),
         ));
         let cancel = cancel.drop_guard();
 
-        Self { sender, cancel }
+        Self {
+            sender,
+            config,
+            cancel,
+        }
     }
 
     pub async fn request(&self, req: Request) -> Result<Response> {
@@ -51,7 +53,7 @@ impl Client {
         let timeout = Instant::now();
 
         while let Some(req) = pending_req.take() {
-            if timeout.elapsed() > Duration::from_secs(5) {
+            if timeout.elapsed() > self.config.client_retry_timeout() {
                 break;
             } else if let Some(sender) = self.sender.lock().await.as_mut() {
                 match sender.try_send_request(req).await {
@@ -66,7 +68,7 @@ impl Client {
                 last_error = Some(anyhow!("No connection to leader"));
                 pending_req = Some(req);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // TODO: fix hard-coded sleep
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("Unknown error")))
@@ -75,6 +77,7 @@ impl Client {
     async fn reconnect(
         mut watch_leader: watch::Receiver<Option<Node>>,
         sender: Arc<Mutex<Option<SendRequest<Body>>>>,
+        config: Config,
         cancel: CancellationToken,
     ) {
         let mut conn: Option<Http2Connection> = None;
@@ -131,7 +134,7 @@ impl Client {
               }
 
               // retry after a second if we don't have a connection
-              _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)), if conn.is_none() => {
+              _ = tokio::time::sleep(config.epoch_interval), if conn.is_none() => {
                 continue;
               }
             }

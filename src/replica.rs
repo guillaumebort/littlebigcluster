@@ -13,10 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
-use crate::{db::DB, Node};
-
-const SNAPSHOT_INTERVAL: u32 = 30;
-const KEEP_SNAPSHOTS: usize = 10;
+use crate::{config::Config, db::DB, Node};
 
 #[derive(Debug)]
 pub(crate) struct Replica {
@@ -24,13 +21,18 @@ pub(crate) struct Replica {
     snapshot_epoch: u32,
     epoch: u32,
     db: DB,
+    config: Config,
 }
 
 impl Replica {
     pub const SNAPSHOT_PATH: &'static str = "/_lbc/snapshots";
     pub const WAL_PATH: &'static str = "/_lbc/wal";
 
-    pub async fn open(cluster_id: &str, object_store: Arc<dyn ObjectStore>) -> Result<Self> {
+    pub async fn open(
+        cluster_id: &str,
+        object_store: Arc<dyn ObjectStore>,
+        config: Config,
+    ) -> Result<Self> {
         // Find latest snapshot
         let snapshot_epoch = Self::latest_snapshot_epoch(&object_store).await?;
         debug!(snapshot_epoch, ?object_store, "Restoring snapshot");
@@ -59,6 +61,7 @@ impl Replica {
             snapshot_epoch,
             epoch: snapshot_epoch,
             db,
+            config,
         };
 
         // Do a full refresh (find latest WALs and apply them)
@@ -198,7 +201,7 @@ impl Replica {
         let object_store = self.object_store.clone();
 
         // Snapshot if needed
-        if next_epoch - self.snapshot_epoch >= SNAPSHOT_INTERVAL {
+        if next_epoch - self.snapshot_epoch >= self.config.snapshot_interval_epochs().try_into()? {
             self.snapshot().await?;
         }
 
@@ -261,6 +264,7 @@ impl Replica {
 
         // We are going to upload the snapshot in the background to avoid blocking the leader
         let object_store = self.object_store.clone();
+        let snapshots_to_keep = self.config.snapshots_to_keep;
         tokio::spawn(async move {
             if let Err(e) = Self::put_if_not_exists(
                 &object_store,
@@ -273,7 +277,7 @@ impl Replica {
             } else {
                 trace!(snapshot_epoch, "Snapshot uploaded");
                 // So it's maybe time to GC
-                if let Err(e) = Self::gc(&object_store).await {
+                if let Err(e) = Self::gc(&object_store, snapshots_to_keep).await {
                     error!(?e, "Failed to GC after snapshot");
                 }
             }
@@ -372,7 +376,7 @@ impl Replica {
         self.refresh().await
     }
 
-    pub async fn gc(object_store: &impl ObjectStore) -> Result<()> {
+    pub async fn gc(object_store: &impl ObjectStore, snapshots_to_keep: usize) -> Result<()> {
         // keep N latest snapshots
         let mut snapshots = object_store.list(Some(&Path::from(Self::SNAPSHOT_PATH)));
         let mut snaphost_epochs = Vec::with_capacity(snapshots.size_hint().0);
@@ -394,8 +398,8 @@ impl Replica {
         snaphost_epochs.sort_unstable();
         snaphost_epochs.reverse();
 
-        let latest_snapshot_epoch = if snaphost_epochs.len() > KEEP_SNAPSHOTS {
-            let (keep, delete) = snaphost_epochs.split_at(KEEP_SNAPSHOTS);
+        let latest_snapshot_epoch = if snaphost_epochs.len() > snapshots_to_keep {
+            let (keep, delete) = snaphost_epochs.split_at(snapshots_to_keep);
             debug!(
                 ?keep,
                 ?delete,
