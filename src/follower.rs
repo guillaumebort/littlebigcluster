@@ -3,9 +3,7 @@ use std::{future::Future, sync::Arc};
 use anyhow::Result;
 use futures::future::BoxFuture;
 use object_store::ObjectStore;
-use sqlx::{
-    query::QueryScalar, sqlite::SqliteRow, Database, Executor, FromRow, Sqlite, SqlitePool, Type,
-};
+use sqlx::{Executor, Sqlite, SqlitePool};
 use tokio::{select, sync::watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error};

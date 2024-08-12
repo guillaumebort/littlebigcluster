@@ -1,11 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
 use littlebigcluster::{Config, Follower, Leader, LittleBigCluster, StandByLeader};
 use object_store::local::LocalFileSystem;
-use sqlx::{Database, Executor, Sqlite};
+use sqlx::Executor;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{
     layer::{Layer, SubscriberExt},
