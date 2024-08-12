@@ -21,6 +21,7 @@ use tracing::{debug, error};
 
 use crate::{
     db::{Ack, DB},
+    leader::LeaderState,
     replica::Replica,
     LeaderStatus, Node,
 };
@@ -32,91 +33,14 @@ pub struct Server {
     serve: JoinHandle<Result<(), std::io::Error>>,
 }
 
-#[derive(Debug)]
-struct LeaderStateInner {
-    node: Node,
-    leader_status: LeaderStatus,
-    replica: Arc<RwLock<Replica>>,
-    db: DB,
-}
-
-#[derive(Clone, Debug)]
-pub struct LeaderState {
-    inner: Arc<LeaderStateInner>,
-}
-
-impl LeaderState {
-    pub(crate) async fn new(
-        node: Node,
-        leader_status: LeaderStatus,
-        replica: Arc<RwLock<Replica>>,
-    ) -> Self {
-        let db = replica.read().await.owned_db().clone();
-        Self {
-            inner: Arc::new(LeaderStateInner {
-                node,
-                leader_status,
-                replica,
-                db,
-            }),
-        }
-    }
-
-    pub fn is_leader(&self) -> bool {
-        self.inner.leader_status.is_leader()
-    }
-
-    pub fn db(&self) -> impl Executor<Database = Sqlite> {
-        self.inner.db.read_pool()
-    }
-
-    pub async fn transaction<A, E>(
-        &self,
-        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
-    ) -> Result<Ack<A>>
-    where
-        A: Send + Unpin + 'static,
-        E: Into<anyhow::Error> + Send,
-    {
-        self.inner.db.transaction(thunk).await
-    }
-
-    pub async fn execute<'a>(
-        &'a self,
-        query: sqlx::query::Query<'a, Sqlite, <Sqlite as sqlx::Database>::Arguments<'a>>,
-    ) -> Result<Ack<SqliteQueryResult>> {
-        self.inner.db.execute(query).await
-    }
-
-    pub async fn execute_batch(
-        &self,
-        query: sqlx::RawSql<'static>,
-    ) -> Result<Ack<SqliteQueryResult>> {
-        self.inner.db.execute_batch(query).await
-    }
-}
-
 impl Server {
     pub async fn start(
         node: &mut Node,
-        router: Router<LeaderState>,
-        leader_status: LeaderStatus,
-        replica: Arc<RwLock<Replica>>,
+        router: Router,
     ) -> Result<Self> {
-        let address = node
-            .address
-            .ok_or_else(|| anyhow!("Leader node must have an address"))?;
-        let listener = tokio::net::TcpListener::bind(address).await?;
+        let listener = tokio::net::TcpListener::bind(node.address).await?;
         let address = listener.local_addr()?;
-        node.address = Some(address);
-
-        let state = LeaderState::new(node.clone(), leader_status, replica).await;
-
-        let system_router = Router::new().route("/status", get(status));
-        let router = Router::new()
-            .nest("/_lbc", system_router)
-            .merge(router.layer(middleware::from_fn_with_state(state.clone(), leader_only)))
-            .with_state(state);
+        node.address = address;
 
         let (notify_shutdown, on_shutdow) = tokio::sync::oneshot::channel();
         let serve = tokio::spawn(
@@ -144,71 +68,9 @@ impl Server {
     }
 }
 
-async fn leader_only(State(state): State<LeaderState>, request: Request, next: Next) -> Response {
-    if state.is_leader() {
-        next.run(request).await
-    } else {
-        (match state.inner.replica.read().await.leader().await {
-            Ok(leader) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "Not the leader - try another!",
-                    "leader": (if let Some(leader) = leader {
-                        json!({
-                            "uuid": leader.uuid.to_string(),
-                            "az": leader.az,
-                            "address": leader.address.map(|a| a.to_string()).unwrap_or_default(),
-                        })
-                    } else {
-                        json!(null)
-                    })
-                })),
-            ),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            ),
-        })
-        .into_response()
-    }
-}
+pub type JsonResponse = Result<Json<serde_json::Value>, ServerError>;
 
-#[debug_handler]
-async fn status(State(state): State<LeaderState>) -> JsonResponse {
-    let replica = state.inner.replica.read().await;
-    Ok(Json(json!({
-        "cluster_id": state.inner.node.cluster_id,
-        "node": {
-            "uuid": state.inner.node.uuid.to_string(),
-            "az": state.inner.node.az,
-            "address": state.inner.node.address.map(|a| a.to_string()).unwrap_or_default(),
-        },
-        "leader": (if let Some(leader) = replica.leader().await? {
-            json!({
-                "uuid": leader.uuid.to_string(),
-                "az": leader.az,
-                "address": leader.address.map(|a| a.to_string()).unwrap_or_default(),
-            })
-        } else {
-            json!(null)
-        }),
-        "replica": {
-            "epoch": replica.epoch(),
-            "last_update": replica.last_update().await?.to_rfc3339(),
-            "snapshot_epoch": replica.snapshot_epoch(),
-        },
-        "db": {
-            "path": state.inner.db.path().display().to_string(),
-            "size": tokio::fs::metadata(state.inner.db.path()).await?.len(),
-            "SELECT 1": sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(state.db()).await?,
-        },
-        "status": (if state.is_leader() { "leader" } else { "standby" }),
-    })))
-}
-
-type JsonResponse = Result<Json<serde_json::Value>, ServerError>;
-
-struct ServerError(anyhow::Error);
+pub struct ServerError(anyhow::Error);
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {

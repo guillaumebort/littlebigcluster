@@ -1,17 +1,64 @@
-use std::{future::Future, sync::Arc};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
+use axum::{debug_handler, extract::State, routing::get, Json, Router};
 use futures::future::BoxFuture;
 use object_store::ObjectStore;
+use serde_json::json;
 use sqlx::{Executor, Sqlite, SqlitePool};
-use tokio::{select, sync::watch};
+use tokio::{
+    select,
+    sync::{watch, RwLock},
+};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error};
 use uuid::Uuid;
 
-use crate::{client::LeaderClient, config::Config, db::DB, replica::Replica, Node};
+use crate::{
+    client::LeaderClient,
+    config::Config,
+    db::DB,
+    replica::{self, Replica},
+    server::{JsonResponse, Server},
+    LeaderState, Node,
+};
+
+#[derive(Debug)]
+struct FollowerStateInner {
+    node: Node,
+    replica: Arc<RwLock<Replica>>,
+    db: DB,
+}
+
+#[derive(Clone, Debug)]
+pub struct FollowerState {
+    inner: Arc<FollowerStateInner>,
+}
+
+impl FollowerState {
+    pub(crate) async fn new(node: Node, replica: Arc<RwLock<Replica>>) -> Self {
+        let db = replica.read().await.db().clone();
+        Self {
+            inner: Arc::new(FollowerStateInner { node, replica, db }),
+        }
+    }
+
+    pub fn db(&self) -> impl Executor<Database = Sqlite> {
+        self.inner.db.read_pool()
+    }
+
+    pub fn node(&self) -> &Node {
+        &self.inner.node
+    }
+
+    pub(crate) fn replica(&self) -> Arc<RwLock<Replica>> {
+        self.inner.replica.clone()
+    }
+}
 
 pub trait Follower {
+    fn shutdown(self) -> impl Future<Output = Result<()>>;
+
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>>;
 
     fn watch_epoch(&self) -> &watch::Receiver<u32>;
@@ -21,6 +68,8 @@ pub trait Follower {
     fn leader_client(&self) -> &LeaderClient;
 
     fn uuid(&self) -> Uuid;
+
+    fn address(&self) -> SocketAddr;
 
     fn object_store(&self) -> &Arc<dyn ObjectStore>;
 
@@ -40,13 +89,15 @@ pub struct FollowerNode {
     watch_leader_node: watch::Receiver<Option<Node>>,
     watch_epoch: watch::Receiver<u32>,
     leader_client: LeaderClient,
+    server: Server,
     #[allow(unused)]
     cancel: DropGuard,
 }
 
 impl FollowerNode {
     pub async fn join(
-        node: Node,
+        mut node: Node,
+        router: Router<FollowerState>,
         object_store: Arc<dyn ObjectStore>,
         config: Config,
     ) -> Result<Self> {
@@ -55,14 +106,25 @@ impl FollowerNode {
         // Open the replica
         let replica = Replica::open(&node.cluster_id, object_store.clone(), config.clone()).await?;
 
-        // Get a (read-only) DB
-        let db = replica.owned_db();
+        // Get a read only db
+        let db: DB = replica.db().clone();
 
         // Create a watch for the leader node
         let (leader_updates, watch_leader_node) = watch::channel(replica.leader().await?);
 
         // Create a watch for the epoch
         let (epoch_updates, watch_epoch) = watch::channel(replica.epoch());
+
+        let replica = Arc::new(RwLock::new(replica));
+
+        // Start the server
+        let state = FollowerState::new(node.clone(), replica.clone()).await;
+        let system_router = Router::new().route("/status", get(status));
+        let router = Router::new()
+            .nest("/_lbc", system_router)
+            .merge(router)
+            .with_state(state);
+        let server = Server::start(&mut node, router).await?;
 
         // Keep the replica up-to-date until the follower is dropped
         let cancel = CancellationToken::new();
@@ -84,18 +146,20 @@ impl FollowerNode {
             watch_leader_node,
             watch_epoch,
             leader_client,
+            server,
             cancel: cancel.drop_guard(),
         })
     }
 
     async fn follow(
-        mut replica: Replica,
+        replica: Arc<RwLock<Replica>>,
         leader_updates: watch::Sender<Option<Node>>,
         epoch_updates: watch::Sender<u32>,
         config: Config,
         cancel: CancellationToken,
     ) -> Result<()> {
         while !cancel.is_cancelled() {
+            let mut replica = replica.write().await;
             replica.refresh().await?;
 
             // Notify the epoch change
@@ -120,6 +184,8 @@ impl FollowerNode {
                 }
             });
 
+            drop(replica);
+
             // Wait for the next epoch
             tokio::time::sleep(config.epoch_interval).await;
         }
@@ -128,6 +194,16 @@ impl FollowerNode {
 }
 
 impl Follower for FollowerNode {
+    async fn shutdown(self) -> Result<()> {
+        // Gracefully shutdown the server
+        self.server.shutdown().await?;
+
+        // Stop refresh task
+        drop(self.cancel);
+
+        Ok(())
+    }
+
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>> {
         &self.watch_leader_node
     }
@@ -146,6 +222,10 @@ impl Follower for FollowerNode {
 
     fn uuid(&self) -> Uuid {
         self.node.uuid
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.node.address
     }
 
     fn object_store(&self) -> &Arc<dyn ObjectStore> {
@@ -193,4 +273,37 @@ impl Follower for FollowerNode {
         });
         Ok(rx)
     }
+}
+
+#[debug_handler]
+async fn status(State(state): State<FollowerState>) -> JsonResponse {
+    let replica = state.replica();
+    let replica = replica.read().await;
+    Ok(Json(json!({
+        "cluster_id": state.node().cluster_id,
+        "node": {
+            "uuid": state.node().uuid.to_string(),
+            "az": state.node().az,
+            "address": state.node().address,
+        },
+        "leader": (if let Some(leader) = replica.leader().await? {
+            json!({
+                "uuid": leader.uuid.to_string(),
+                "az": leader.az,
+                "address": leader.address,
+            })
+        } else {
+            json!(null)
+        }),
+        "replica": {
+            "epoch": replica.epoch(),
+            "last_update": replica.last_update().await?.to_rfc3339(),
+            "snapshot_epoch": replica.snapshot_epoch(),
+        },
+        "db": {
+            "path": replica.db().path().display().to_string(),
+            "size": tokio::fs::metadata(replica.db().path()).await?.len(),
+            "SELECT 1": sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(state.db()).await?,
+        },
+    })))
 }

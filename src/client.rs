@@ -86,7 +86,7 @@ impl LeaderClient {
             let leader_address = watch_leader
                 .borrow_and_update()
                 .as_ref()
-                .and_then(|node| node.address);
+                .map(|node| node.address);
 
             // if we don't have a connection and we have a leader, let's try to open one
             if let (None, Some(leader_address)) = (&conn, leader_address) {

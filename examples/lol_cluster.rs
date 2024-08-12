@@ -5,7 +5,6 @@ use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
 use littlebigcluster::{Config, Follower, Leader, LittleBigCluster, StandByLeader};
 use object_store::local::LocalFileSystem;
-use sqlx::Executor;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{
     layer::{Layer, SubscriberExt},
@@ -124,7 +123,7 @@ pub async fn main() {
     let command_result = match args.command {
         Command::Init => init_cluster(&cluster).await,
         Command::Leader => leader::join(cluster, args.az, args.address).await,
-        Command::Follower => follower::join(cluster, args.az).await,
+        Command::Follower => follower::join(cluster, args.az, args.address).await,
     };
 
     if let Err(err) = command_result {
@@ -150,15 +149,19 @@ async fn init_cluster(cluster: &LittleBigCluster) -> Result<()> {
 }
 
 mod follower {
+    use axum::Router;
     use futures::FutureExt;
     use tokio::select;
 
     use super::*;
 
-    pub async fn join(cluster: LittleBigCluster, az: String) -> Result<()> {
+    pub async fn join(cluster: LittleBigCluster, az: String, address: SocketAddr) -> Result<()> {
         info!("Joining cluster as follower...");
-        let follower = cluster.join_as_follower(az).await?;
+        let follower = cluster
+            .join_as_follower(az, address, Router::new(), "follower")
+            .await?;
         info!("Joined cluster!");
+        info!("Listening on http://{}", follower.address());
 
         let mut watch_leader = follower.watch_leader().clone();
         let mut watch_value = follower
@@ -199,6 +202,9 @@ mod follower {
                 }
             }
         }
+
+        follower.shutdown().await?;
+        info!("Exited gracefully");
 
         Ok(())
     }

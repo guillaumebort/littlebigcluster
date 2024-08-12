@@ -5,10 +5,19 @@ use std::{
 };
 
 use anyhow::Result;
-use axum::Router;
+use axum::{
+    debug_handler,
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
 use chrono::Utc;
 use futures::future::BoxFuture;
+use hyper::StatusCode;
 use object_store::ObjectStore;
+use serde_json::json;
 use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, Transaction};
 use tokio::{
     select,
@@ -20,10 +29,82 @@ use tracing::{debug, error, trace};
 use crate::{
     config::Config,
     db::{Ack, DB},
-    replica::Replica,
-    server::{LeaderState, Server},
+    replica::{self, Replica},
+    server::{JsonResponse, Server},
     Node,
 };
+
+#[derive(Debug)]
+struct LeaderStateInner {
+    node: Node,
+    leader_status: LeaderStatus,
+    replica: Arc<RwLock<Replica>>,
+    db: DB,
+}
+
+#[derive(Clone, Debug)]
+pub struct LeaderState {
+    inner: Arc<LeaderStateInner>,
+}
+
+impl LeaderState {
+    pub(crate) async fn new(
+        node: Node,
+        leader_status: LeaderStatus,
+        replica: Arc<RwLock<Replica>>,
+    ) -> Self {
+        let db = replica.read().await.db().clone();
+        Self {
+            inner: Arc::new(LeaderStateInner {
+                node,
+                leader_status,
+                replica,
+                db,
+            }),
+        }
+    }
+
+    pub fn node(&self) -> &Node {
+        &self.inner.node
+    }
+
+    pub fn is_leader(&self) -> bool {
+        self.inner.leader_status.is_leader()
+    }
+
+    pub fn db(&self) -> impl Executor<Database = Sqlite> {
+        self.inner.db.read_pool()
+    }
+
+    pub async fn transaction<A, E>(
+        &self,
+        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
+    ) -> Result<Ack<A>>
+    where
+        A: Send + Unpin + 'static,
+        E: Into<anyhow::Error> + Send,
+    {
+        self.inner.db.transaction(thunk).await
+    }
+
+    pub async fn execute<'a>(
+        &'a self,
+        query: sqlx::query::Query<'a, Sqlite, <Sqlite as sqlx::Database>::Arguments<'a>>,
+    ) -> Result<Ack<SqliteQueryResult>> {
+        self.inner.db.execute(query).await
+    }
+
+    pub async fn execute_batch(
+        &self,
+        query: sqlx::RawSql<'static>,
+    ) -> Result<Ack<SqliteQueryResult>> {
+        self.inner.db.execute_batch(query).await
+    }
+
+    pub(crate) fn replica(&self) -> &Arc<RwLock<Replica>> {
+        &self.inner.replica
+    }
+}
 
 pub trait Leader {
     fn shutdown(self) -> impl Future<Output = Result<()>>;
@@ -112,12 +193,23 @@ impl LeaderNode {
 
         // Open the replica
         let replica = Replica::open(&node.cluster_id, object_store.clone(), config.clone()).await?;
-        let db: DB = replica.owned_db();
+        let db: DB = replica.db().clone();
         let replica = Arc::new(RwLock::new(replica));
 
         // Start the server
-        let server =
-            Server::start(&mut node, router, leader_status.clone(), replica.clone()).await?;
+        let state = LeaderState::new(node.clone(), leader_status.clone(), replica.clone()).await;
+        let system_router = Router::new()
+            .route("/status", get(status))
+            .route("/gossip", get(gossip));
+        let router = Router::new()
+            .nest("/_lbc", system_router)
+            .merge(router)
+            .with_state(state.clone());
+        let server = Server::start(
+            &mut node,
+            router.layer(middleware::from_fn_with_state(state.clone(), leader_only)),
+        )
+        .await?;
 
         // drop guard so we stop everything when the leader is dropped
         let cancel = CancellationToken::new().drop_guard();
@@ -294,4 +386,72 @@ impl Leader for LeaderNode {
     fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object_store
     }
+}
+
+async fn leader_only(State(state): State<LeaderState>, request: Request, next: Next) -> Response {
+    if state.is_leader() {
+        next.run(request).await
+    } else {
+        (match state.replica().read().await.leader().await {
+            Ok(leader) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "Not the leader - try another!",
+                    "leader": (if let Some(leader) = leader {
+                        json!({
+                            "uuid": leader.uuid.to_string(),
+                            "az": leader.az,
+                            "address": leader.address,
+                        })
+                    } else {
+                        json!(null)
+                    })
+                })),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            ),
+        })
+        .into_response()
+    }
+}
+
+#[debug_handler]
+async fn status(State(state): State<LeaderState>) -> JsonResponse {
+    let replica = state.replica();
+    let replica = replica.read().await;
+    Ok(Json(json!({
+        "cluster_id": state.node().cluster_id,
+        "node": {
+            "uuid": state.node().uuid.to_string(),
+            "az": state.node().az,
+            "address": state.node().address,
+        },
+        "leader": (if let Some(leader) = replica.leader().await? {
+            json!({
+                "uuid": leader.uuid.to_string(),
+                "az": leader.az,
+                "address": leader.address,
+            })
+        } else {
+            json!(null)
+        }),
+        "replica": {
+            "epoch": replica.epoch(),
+            "last_update": replica.last_update().await?.to_rfc3339(),
+            "snapshot_epoch": replica.snapshot_epoch(),
+        },
+        "db": {
+            "path": replica.db().path().display().to_string(),
+            "size": tokio::fs::metadata(replica.db().path()).await?.len(),
+            "SELECT 1": sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(state.db()).await?,
+        },
+        "status": (if state.is_leader() { "leader" } else { "standby" }),
+    })))
+}
+
+#[debug_handler]
+async fn gossip(State(state): State<LeaderState>) -> JsonResponse {
+    todo!()
 }

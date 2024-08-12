@@ -12,12 +12,11 @@ use anyhow::Result;
 use axum::Router;
 pub use config::Config;
 pub use follower::Follower;
-use follower::FollowerNode;
+use follower::{FollowerNode, FollowerState};
 use leader::LeaderNode;
-pub use leader::{Leader, LeaderStatus, StandByLeader};
+pub use leader::{Leader, LeaderState, LeaderStatus, StandByLeader};
 use object_store::ObjectStore;
 use replica::Replica;
-pub use server::LeaderState;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,17 +24,19 @@ pub struct Node {
     pub uuid: Uuid,
     pub cluster_id: String,
     pub az: String,
-    pub address: Option<SocketAddr>,
+    pub address: SocketAddr,
+    pub role: String,
 }
 
 impl Node {
-    pub fn new(cluster_id: String, az: String, address: Option<SocketAddr>) -> Self {
+    pub fn new(cluster_id: String, az: String, address: SocketAddr, role: String) -> Self {
         let uuid = Uuid::now_v7();
         Self {
             uuid,
             cluster_id,
             az,
             address,
+            role,
         }
     }
 }
@@ -67,17 +68,28 @@ impl LittleBigCluster {
 
     pub async fn join_as_leader(
         self,
-        az: String,
-        address: SocketAddr,
+        az: impl Into<String>,
+        address: impl Into<SocketAddr>,
         router: Router<LeaderState>,
     ) -> Result<impl StandByLeader> {
-        let node = Node::new(self.cluster_id, az, Some(address));
+        let node = Node::new(
+            self.cluster_id,
+            az.into(),
+            address.into(),
+            "leader".to_string(),
+        );
         LeaderNode::join(node, router, self.object_store, self.config).await
     }
 
-    pub async fn join_as_follower(self, az: String) -> Result<impl Follower> {
-        let node = Node::new(self.cluster_id, az, None);
-        FollowerNode::join(node, self.object_store, self.config).await
+    pub async fn join_as_follower(
+        self,
+        az: impl Into<String>,
+        address: impl Into<SocketAddr>,
+        router: Router<FollowerState>,
+        role: impl Into<String>,
+    ) -> Result<impl Follower> {
+        let node = Node::new(self.cluster_id, az.into(), address.into(), role.into());
+        FollowerNode::join(node, router, self.object_store, self.config).await
     }
 
     pub async fn init(&self) -> Result<()> {

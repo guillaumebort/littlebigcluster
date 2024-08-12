@@ -150,8 +150,8 @@ impl Replica {
         self.snapshot_epoch
     }
 
-    pub fn owned_db(&self) -> DB {
-        self.db.clone()
+    pub fn db(&self) -> &DB {
+        &self.db
     }
 
     pub async fn last_update(&self) -> Result<DateTime<Utc>> {
@@ -185,8 +185,9 @@ impl Replica {
             Some(Node {
                 uuid: Uuid::parse_str(&uuid)?,
                 az,
-                address: address.parse().ok(),
+                address: address.parse()?,
                 cluster_id,
+                role: "leader".to_string(),
             })
         } else {
             None
@@ -301,8 +302,7 @@ impl Replica {
                 )
                 .bind(leader.uuid.to_string())
                 .bind(leader
-                    .address
-                    .map(|a| a.to_string()).unwrap_or_default()
+                    .address.to_string()
                 )
                 .bind(leader.az).execute(&mut *txn).await?;
             } else {
