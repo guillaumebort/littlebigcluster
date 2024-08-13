@@ -140,6 +140,7 @@ fn open_cluster(cluster_id: &str, path: &std::path::Path) -> Result<LittleBigClu
             epoch_interval: Duration::from_secs(1),
             snapshot_interval: Duration::from_secs(30),
             snapshots_to_keep: 5,
+            gossip_interval: Duration::from_secs(1),
         },
     )
 }

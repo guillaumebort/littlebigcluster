@@ -18,9 +18,9 @@ use crate::{
     client::LeaderClient,
     config::Config,
     db::DB,
-    replica::{self, Replica},
+    replica::Replica,
     server::{JsonResponse, Server},
-    LeaderState, Node,
+    Node,
 };
 
 #[derive(Debug)]
@@ -137,7 +137,7 @@ impl FollowerNode {
         ));
 
         // Start an http2 client always connected to the current leader
-        let leader_client = LeaderClient::new(watch_leader_node.clone(), config);
+        let leader_client = LeaderClient::new(node.clone(), watch_leader_node.clone(), config);
 
         Ok(Self {
             node,

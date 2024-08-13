@@ -6,8 +6,10 @@ use axum::{
     extract::Request,
     response::{IntoResponse, Response},
 };
+use futures::FutureExt;
 use hyper::client::conn::http2::{self, Connection, SendRequest};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use serde_json::json;
 use tokio::{
     net::TcpStream,
     select,
@@ -29,15 +31,26 @@ pub struct LeaderClient {
 type Http2Connection = Connection<TokioIo<TcpStream>, Body, TokioExecutor>;
 
 impl LeaderClient {
-    pub fn new(watch_leader: watch::Receiver<Option<Node>>, config: Config) -> Self {
+    pub fn new(node: Node, watch_leader: watch::Receiver<Option<Node>>, config: Config) -> Self {
         let cancel = CancellationToken::new();
         let sender = Arc::new(Mutex::new(None));
+
+        // will keep trying to reconnect to the leader
         tokio::spawn(Self::reconnect(
             watch_leader,
             sender.clone(),
             config.clone(),
             cancel.child_token(),
         ));
+
+        // will run the gossip protocol
+        tokio::spawn(Self::gossip(
+            node,
+            sender.clone(),
+            config.clone(),
+            cancel.child_token(),
+        ));
+
         let cancel = cancel.drop_guard();
 
         Self {
@@ -97,8 +110,8 @@ impl LeaderClient {
                         *sender.lock().await = Some(new_sender);
                         debug!(?leader_address, "Connected to leader!");
                     }
-                    Err(e) => {
-                        error!(?e, "Failed to connect to leader");
+                    Err(err) => {
+                        debug!(?err, "Failed to connect to leader");
                     }
                 }
             }
@@ -137,6 +150,60 @@ impl LeaderClient {
               _ = tokio::time::sleep(config.epoch_interval), if conn.is_none() => {
                 continue;
               }
+            }
+        }
+    }
+
+    async fn gossip(
+        node: Node,
+        sender: Arc<Mutex<Option<SendRequest<Body>>>>,
+        config: Config,
+        cancel: CancellationToken,
+    ) {
+        while !cancel.is_cancelled() {
+            let res = {
+                if let Some(sender) = sender.lock().await.as_mut() {
+                    let req = Request::builder()
+                        .uri("/_lbc/gossip")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "uuid": node.uuid.to_string(),
+                                "address": node.address.to_string(),
+                                "az": node.az.to_string(),
+                                "role": node.role.to_string(),
+                            })
+                            .to_string()
+                            .as_bytes()
+                            .to_vec(),
+                        ))
+                        .unwrap();
+                    sender
+                        .send_request(req)
+                        .map(|r| r.map_err(|e| e.into()))
+                        .boxed()
+                } else {
+                    futures::future::ready(Err(anyhow!("No connection to leader"))).boxed()
+                }
+            };
+
+            let result = res.await.and_then(|res| {
+                if res.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(anyhow!("{}", res.status()))
+                }
+            });
+
+            if let Err(err) = result {
+                debug!(?err, "Failed to gossip");
+            }
+
+            select! {
+              _ = cancel.cancelled() => {
+                break;
+              }
+              _ = tokio::time::sleep(config.gossip_interval) => {}
             }
         }
     }

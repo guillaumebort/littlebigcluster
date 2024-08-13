@@ -76,7 +76,7 @@ impl LittleBigCluster {
             self.cluster_id,
             az.into(),
             address.into(),
-            "leader".to_string(),
+            "leader(standby)".to_string(),
         );
         LeaderNode::join(node, router, self.object_store, self.config).await
     }

@@ -1,30 +1,17 @@
-use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
+use std::{future::IntoFuture, net::SocketAddr};
 
 use anyhow::{anyhow, Result};
 use axum::{
-    debug_handler,
-    extract::{Request, State},
     http::StatusCode,
-    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
     Json, Router,
 };
-use futures::{future::BoxFuture, FutureExt};
+use futures::FutureExt;
 use serde_json::json;
-use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, Transaction};
-use tokio::{
-    sync::{oneshot, RwLock},
-    task::JoinHandle,
-};
+use tokio::{sync::oneshot, task::JoinHandle};
 use tracing::{debug, error};
 
-use crate::{
-    db::{Ack, DB},
-    leader::LeaderState,
-    replica::Replica,
-    LeaderStatus, Node,
-};
+use crate::Node;
 
 #[derive(Debug)]
 pub struct Server {
@@ -34,10 +21,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn start(
-        node: &mut Node,
-        router: Router,
-    ) -> Result<Self> {
+    pub async fn start(node: &mut Node, router: Router) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind(node.address).await?;
         let address = listener.local_addr()?;
         node.address = address;

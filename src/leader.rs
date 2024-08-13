@@ -21,15 +21,16 @@ use serde_json::json;
 use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, Transaction};
 use tokio::{
     select,
-    sync::{Notify, RwLock},
+    sync::{watch, Notify, RwLock},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
 
 use crate::{
+    client::LeaderClient,
     config::Config,
     db::{Ack, DB},
-    replica::{self, Replica},
+    replica::Replica,
     server::{JsonResponse, Server},
     Node,
 };
@@ -256,6 +257,16 @@ impl LeaderNode {
 impl StandByLeader for LeaderNode {
     async fn wait_for_leadership(mut self) -> Result<impl Leader> {
         debug!("Waiting for leadership...");
+
+        // HTTP client connected to the leader
+        let (leader_updates, watch_leader_node) =
+            watch::channel(self.replica.read().await.leader().await?);
+        let _leader_client = LeaderClient::new(
+            self.node.clone(),
+            watch_leader_node.clone(),
+            self.config.clone(),
+        );
+
         loop {
             let mut replica = self.replica.write().await;
             // Refresh the replica
@@ -264,6 +275,14 @@ impl StandByLeader for LeaderNode {
             // Check current leader
             let current_leader = replica.leader().await?;
             let last_update = replica.last_update().await?;
+            leader_updates.send_if_modified(|state| {
+                if current_leader != *state {
+                    *state = current_leader.clone();
+                    true
+                } else {
+                    false
+                }
+            });
 
             // If there is no leader OR the leader is stale
             if current_leader.is_none()
@@ -281,6 +300,7 @@ impl StandByLeader for LeaderNode {
                         // We are the leader!
                         debug!("Acquired leadership");
                         self.leader_status.set_leader(true);
+                        self.node.role = "leader".to_string();
 
                         // Spawn a keep-alive task incrementing the epoch and safely synchronizing the DB
                         // until the leader is dropped or explicitly shutdown
@@ -452,6 +472,10 @@ async fn status(State(state): State<LeaderState>) -> JsonResponse {
 }
 
 #[debug_handler]
-async fn gossip(State(state): State<LeaderState>) -> JsonResponse {
-    todo!()
+async fn gossip(
+    State(state): State<LeaderState>,
+    Json(payload): Json<serde_json::Value>,
+) -> JsonResponse {
+    dbg!(payload);
+    Ok(Json(json!("ok")))
 }

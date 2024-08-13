@@ -5,6 +5,7 @@ pub struct Config {
     pub epoch_interval: Duration,
     pub snapshot_interval: Duration,
     pub snapshots_to_keep: usize,
+    pub gossip_interval: Duration,
 }
 
 impl Config {
