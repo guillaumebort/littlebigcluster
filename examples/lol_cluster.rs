@@ -29,7 +29,7 @@ struct Args {
     verbose: u8,
 
     #[arg(short, long)]
-    #[clap(default_value = "127.0.0.1:0")]
+    #[clap(default_value = "0.0.0.0:0")]
     address: SocketAddr,
 
     #[arg(long)]
