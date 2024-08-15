@@ -24,22 +24,28 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct FollowerStateInner {
+struct ClusterStateInner {
     node: Node,
+    roles: Vec<String>,
     replica: Arc<RwLock<Replica>>,
     db: DB,
 }
 
 #[derive(Clone, Debug)]
-pub struct FollowerState {
-    inner: Arc<FollowerStateInner>,
+pub struct ClusterState {
+    inner: Arc<ClusterStateInner>,
 }
 
-impl FollowerState {
-    pub(crate) async fn new(node: Node, replica: Arc<RwLock<Replica>>) -> Self {
+impl ClusterState {
+    pub(crate) async fn new(node: Node, roles: Vec<String>, replica: Arc<RwLock<Replica>>) -> Self {
         let db = replica.read().await.db().clone();
         Self {
-            inner: Arc::new(FollowerStateInner { node, replica, db }),
+            inner: Arc::new(ClusterStateInner {
+                node,
+                roles,
+                replica,
+                db,
+            }),
         }
     }
 
@@ -47,8 +53,12 @@ impl FollowerState {
         self.inner.db.read_pool()
     }
 
-    pub fn node(&self) -> &Node {
+    pub fn this(&self) -> &Node {
         &self.inner.node
+    }
+
+    pub fn roles(&self) -> &[String] {
+        &self.inner.roles
     }
 
     pub(crate) fn replica(&self) -> Arc<RwLock<Replica>> {
@@ -97,8 +107,9 @@ pub struct FollowerNode {
 impl FollowerNode {
     pub async fn join(
         mut node: Node,
-        router: Router<FollowerState>,
+        router: Router<ClusterState>,
         object_store: Arc<dyn ObjectStore>,
+        roles: Vec<String>,
         config: Config,
     ) -> Result<Self> {
         debug!(?node, "Joining cluster as follower");
@@ -118,7 +129,7 @@ impl FollowerNode {
         let replica = Arc::new(RwLock::new(replica));
 
         // Start the server
-        let state = FollowerState::new(node.clone(), replica.clone()).await;
+        let state = ClusterState::new(node.clone(), roles.clone(), replica.clone()).await;
         let system_router = Router::new().route("/status", get(status));
         let router = Router::new()
             .nest("/_lbc", system_router)
@@ -137,7 +148,7 @@ impl FollowerNode {
         ));
 
         // Start an http2 client always connected to the current leader
-        let leader_client = LeaderClient::new(node.clone(), watch_leader_node.clone(), config);
+        let leader_client = LeaderClient::new(node.clone(), roles, watch_leader_node.clone(), config);
 
         Ok(Self {
             node,
@@ -200,6 +211,9 @@ impl Follower for FollowerNode {
 
         // Stop refresh task
         drop(self.cancel);
+
+        // Close the leader client
+        self.leader_client.shutdown().await?;
 
         Ok(())
     }
@@ -276,25 +290,13 @@ impl Follower for FollowerNode {
 }
 
 #[debug_handler]
-async fn status(State(state): State<FollowerState>) -> JsonResponse {
+async fn status(State(state): State<ClusterState>) -> JsonResponse {
     let replica = state.replica();
     let replica = replica.read().await;
     Ok(Json(json!({
-        "cluster_id": state.node().cluster_id,
-        "node": {
-            "uuid": state.node().uuid.to_string(),
-            "az": state.node().az,
-            "address": state.node().address,
-        },
-        "leader": (if let Some(leader) = replica.leader().await? {
-            json!({
-                "uuid": leader.uuid.to_string(),
-                "az": leader.az,
-                "address": leader.address,
-            })
-        } else {
-            json!(null)
-        }),
+        "this": state.this(),
+        "roles": state.roles(),
+        "leader": replica.leader().await?,
         "replica": {
             "epoch": replica.epoch(),
             "last_update": replica.last_update().await?.to_rfc3339(),
@@ -303,7 +305,6 @@ async fn status(State(state): State<FollowerState>) -> JsonResponse {
         "db": {
             "path": replica.db().path().display().to_string(),
             "size": tokio::fs::metadata(replica.db().path()).await?.len(),
-            "SELECT 1": sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(state.db()).await?,
         },
     })))
 }

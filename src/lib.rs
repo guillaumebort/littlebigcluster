@@ -12,31 +12,30 @@ use anyhow::Result;
 use axum::Router;
 pub use config::Config;
 pub use follower::Follower;
-use follower::{FollowerNode, FollowerState};
+use follower::{ClusterState, FollowerNode};
 use leader::LeaderNode;
 pub use leader::{Leader, LeaderState, LeaderStatus, StandByLeader};
 use object_store::ObjectStore;
 use replica::Replica;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub uuid: Uuid,
     pub cluster_id: String,
     pub az: String,
     pub address: SocketAddr,
-    pub role: String,
 }
 
 impl Node {
-    pub fn new(cluster_id: String, az: String, address: SocketAddr, role: String) -> Self {
+    pub fn new(cluster_id: String, az: String, address: SocketAddr) -> Self {
         let uuid = Uuid::now_v7();
         Self {
             uuid,
             cluster_id,
             az,
             address,
-            role,
         }
     }
 }
@@ -71,25 +70,46 @@ impl LittleBigCluster {
         az: impl Into<String>,
         address: impl Into<SocketAddr>,
         router: Router<LeaderState>,
+        additional_roles: Vec<(String, Router<ClusterState>)>,
     ) -> Result<impl StandByLeader> {
-        let node = Node::new(
-            self.cluster_id,
-            az.into(),
-            address.into(),
-            "leader(standby)".to_string(),
-        );
-        LeaderNode::join(node, router, self.object_store, self.config).await
+        let az = az.into();
+        let address = address.into();
+        let (roles, addtional_router) = Self::roles_with_router(additional_roles)?;
+        let node = Node::new(self.cluster_id, az, address);
+        LeaderNode::join(
+            node,
+            router,
+            addtional_router,
+            self.object_store,
+            roles,
+            self.config,
+        )
+        .await
     }
 
     pub async fn join_as_follower(
         self,
         az: impl Into<String>,
         address: impl Into<SocketAddr>,
-        router: Router<FollowerState>,
-        role: impl Into<String>,
+        roles: Vec<(String, Router<ClusterState>)>,
     ) -> Result<impl Follower> {
-        let node = Node::new(self.cluster_id, az.into(), address.into(), role.into());
-        FollowerNode::join(node, router, self.object_store, self.config).await
+        let az = az.into();
+        let address = address.into();
+        let (roles, router) = Self::roles_with_router(roles)?;
+        let node = Node::new(self.cluster_id, az, address);
+        FollowerNode::join(node, router, self.object_store, roles, self.config).await
+    }
+
+    fn roles_with_router(
+        roles_with_routers: Vec<(String, Router<ClusterState>)>,
+    ) -> Result<(Vec<String>, Router<ClusterState>)> {
+        let mut roles = Vec::with_capacity(roles_with_routers.len());
+        let mut router = Router::new();
+        for (role, role_router) in roles_with_routers {
+            roles.push(role.clone());
+            router = router.merge(role_router);
+        }
+        Ok((roles, router))
     }
 
     pub async fn init(&self) -> Result<()> {

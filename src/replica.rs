@@ -8,6 +8,7 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use object_store::{path::Path, ObjectStore, PutMode, PutOptions};
+use sqlx::Row;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, trace};
@@ -187,7 +188,6 @@ impl Replica {
                 az,
                 address: address.parse()?,
                 cluster_id,
-                role: "leader".to_string(),
             })
         } else {
             None

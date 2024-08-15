@@ -41,7 +41,7 @@ impl Server {
         debug!(?address, "Started server");
 
         // Fix the node address with the correct server address to advertise
-        if !is_forwardable_ip(&address.ip()) {
+        if address.ip().is_unspecified() {
             if let Some(ip) = find_ip_address() {
                 address.set_ip(ip);
             } else {

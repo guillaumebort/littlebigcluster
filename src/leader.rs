@@ -30,6 +30,7 @@ use crate::{
     client::LeaderClient,
     config::Config,
     db::{Ack, DB},
+    follower::ClusterState,
     replica::Replica,
     server::{JsonResponse, Server},
     Node,
@@ -38,6 +39,7 @@ use crate::{
 #[derive(Debug)]
 struct LeaderStateInner {
     node: Node,
+    roles: Vec<String>,
     leader_status: LeaderStatus,
     replica: Arc<RwLock<Replica>>,
     db: DB,
@@ -51,6 +53,7 @@ pub struct LeaderState {
 impl LeaderState {
     pub(crate) async fn new(
         node: Node,
+        roles: Vec<String>,
         leader_status: LeaderStatus,
         replica: Arc<RwLock<Replica>>,
     ) -> Self {
@@ -58,6 +61,7 @@ impl LeaderState {
         Self {
             inner: Arc::new(LeaderStateInner {
                 node,
+                roles,
                 leader_status,
                 replica,
                 db,
@@ -65,7 +69,7 @@ impl LeaderState {
         }
     }
 
-    pub fn node(&self) -> &Node {
+    pub fn this(&self) -> &Node {
         &self.inner.node
     }
 
@@ -75,6 +79,10 @@ impl LeaderState {
 
     pub fn db(&self) -> impl Executor<Database = Sqlite> {
         self.inner.db.read_pool()
+    }
+
+    pub fn roles(&self) -> &[String] {
+        &self.inner.roles
     }
 
     pub async fn transaction<A, E>(
@@ -178,6 +186,7 @@ pub struct LeaderNode {
     object_store: Arc<dyn ObjectStore>,
     server: Server,
     leader_status: LeaderStatus,
+    roles: Vec<String>,
     config: Config,
     cancel: DropGuard,
 }
@@ -186,7 +195,9 @@ impl LeaderNode {
     pub async fn join(
         mut node: Node,
         router: Router<LeaderState>,
+        additional_router: Router<ClusterState>,
         object_store: Arc<dyn ObjectStore>,
+        roles: Vec<String>,
         config: Config,
     ) -> Result<Self> {
         debug!(?node, "Joining cluster as Leader");
@@ -198,19 +209,28 @@ impl LeaderNode {
         let replica = Arc::new(RwLock::new(replica));
 
         // Start the server
-        let state = LeaderState::new(node.clone(), leader_status.clone(), replica.clone()).await;
-        let system_router = Router::new()
-            .route("/status", get(status))
-            .route("/gossip", get(gossip));
-        let router = Router::new()
-            .nest("/_lbc", system_router)
-            .merge(router)
-            .with_state(state.clone());
-        let server = Server::start(
-            &mut node,
-            router.layer(middleware::from_fn_with_state(state.clone(), leader_only)),
-        )
-        .await?;
+        let leader_router = {
+            let state = LeaderState::new(
+                node.clone(),
+                roles.clone(),
+                leader_status.clone(),
+                replica.clone(),
+            )
+            .await;
+            let system_router = Router::new()
+                .route("/status", get(status))
+                .route("/gossip", get(gossip));
+            let router = Router::new()
+                .nest("/_lbc", system_router)
+                .merge(router)
+                .with_state(state.clone());
+            router.layer(middleware::from_fn_with_state(state.clone(), leader_only))
+        };
+        let additional_router = {
+            let state = ClusterState::new(node.clone(), roles.clone(), replica.clone()).await;
+            additional_router.with_state(state)
+        };
+        let server = Server::start(&mut node, leader_router.merge(additional_router)).await?;
 
         // drop guard so we stop everything when the leader is dropped
         let cancel = CancellationToken::new().drop_guard();
@@ -222,6 +242,7 @@ impl LeaderNode {
             object_store,
             server,
             leader_status,
+            roles,
             config,
             cancel,
         })
@@ -263,6 +284,7 @@ impl StandByLeader for LeaderNode {
             watch::channel(self.replica.read().await.leader().await?);
         let _leader_client = LeaderClient::new(
             self.node.clone(),
+            self.roles.clone(),
             watch_leader_node.clone(),
             self.config.clone(),
         );
@@ -300,7 +322,6 @@ impl StandByLeader for LeaderNode {
                         // We are the leader!
                         debug!("Acquired leadership");
                         self.leader_status.set_leader(true);
-                        self.node.role = "leader".to_string();
 
                         // Spawn a keep-alive task incrementing the epoch and safely synchronizing the DB
                         // until the leader is dropped or explicitly shutdown
@@ -442,21 +463,9 @@ async fn status(State(state): State<LeaderState>) -> JsonResponse {
     let replica = state.replica();
     let replica = replica.read().await;
     Ok(Json(json!({
-        "cluster_id": state.node().cluster_id,
-        "node": {
-            "uuid": state.node().uuid.to_string(),
-            "az": state.node().az,
-            "address": state.node().address,
-        },
-        "leader": (if let Some(leader) = replica.leader().await? {
-            json!({
-                "uuid": leader.uuid.to_string(),
-                "az": leader.az,
-                "address": leader.address,
-            })
-        } else {
-            json!(null)
-        }),
+        "this": state.this(),
+        "roles": state.roles(),
+        "leader": replica.leader().await?,
         "replica": {
             "epoch": replica.epoch(),
             "last_update": replica.last_update().await?.to_rfc3339(),
@@ -465,9 +474,8 @@ async fn status(State(state): State<LeaderState>) -> JsonResponse {
         "db": {
             "path": replica.db().path().display().to_string(),
             "size": tokio::fs::metadata(replica.db().path()).await?.len(),
-            "SELECT 1": sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(state.db()).await?,
         },
-        "status": (if state.is_leader() { "leader" } else { "standby" }),
+        "is_leader": state.is_leader(),
     })))
 }
 

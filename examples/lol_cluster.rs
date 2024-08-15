@@ -150,7 +150,6 @@ async fn init_cluster(cluster: &LittleBigCluster) -> Result<()> {
 }
 
 mod follower {
-    use axum::Router;
     use futures::FutureExt;
     use tokio::select;
 
@@ -158,9 +157,7 @@ mod follower {
 
     pub async fn join(cluster: LittleBigCluster, az: String, address: SocketAddr) -> Result<()> {
         info!("Joining cluster as follower...");
-        let follower = cluster
-            .join_as_follower(az, address, Router::new(), "follower")
-            .await?;
+        let follower = cluster.join_as_follower(az, address, vec![]).await?;
         info!("Joined cluster!");
         info!("Listening on http://{}", follower.address());
 
@@ -231,7 +228,7 @@ mod leader {
             .route("/value/set", post(set_value))
             .route("/value/get", get(get_value));
 
-        let standby = cluster.join_as_leader(az, address, router).await?;
+        let standby = cluster.join_as_leader(az, address, router, vec![]).await?;
         info!("Joined cluster! Waiting for leadership...");
 
         let leader = standby.wait_for_leadership().await?;

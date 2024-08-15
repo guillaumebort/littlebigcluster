@@ -14,6 +14,7 @@ use tokio::{
     net::TcpStream,
     select,
     sync::{watch, Mutex},
+    task::JoinHandle,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, warn};
@@ -22,7 +23,9 @@ use crate::{Config, Node};
 
 #[derive(Debug)]
 pub struct LeaderClient {
+    node: Node,
     sender: Arc<Mutex<Option<SendRequest<Body>>>>,
+    gossip_task: JoinHandle<()>,
     config: Config,
     #[allow(unused)]
     cancel: DropGuard,
@@ -31,7 +34,12 @@ pub struct LeaderClient {
 type Http2Connection = Connection<TokioIo<TcpStream>, Body, TokioExecutor>;
 
 impl LeaderClient {
-    pub fn new(node: Node, watch_leader: watch::Receiver<Option<Node>>, config: Config) -> Self {
+    pub fn new(
+        node: Node,
+        roles: Vec<String>,
+        watch_leader: watch::Receiver<Option<Node>>,
+        config: Config,
+    ) -> Self {
         let cancel = CancellationToken::new();
         let sender = Arc::new(Mutex::new(None));
 
@@ -44,8 +52,9 @@ impl LeaderClient {
         ));
 
         // will run the gossip protocol
-        tokio::spawn(Self::gossip(
-            node,
+        let gossip_task = tokio::spawn(Self::gossip(
+            node.clone(),
+            roles,
             sender.clone(),
             config.clone(),
             cancel.child_token(),
@@ -54,7 +63,9 @@ impl LeaderClient {
         let cancel = cancel.drop_guard();
 
         Self {
+            node,
             sender,
+            gossip_task,
             config,
             cancel,
         }
@@ -135,7 +146,7 @@ impl LeaderClient {
                 if let Err(e) = r {
                   error!(?e, "Connection error");
                 } else {
-                  warn!("Connection closed");
+                  debug!("Connection closed");
                 }
                 conn = None;
                 *sender.lock().await = None;
@@ -156,6 +167,7 @@ impl LeaderClient {
 
     async fn gossip(
         node: Node,
+        roles: Vec<String>,
         sender: Arc<Mutex<Option<SendRequest<Body>>>>,
         config: Config,
         cancel: CancellationToken,
@@ -168,10 +180,8 @@ impl LeaderClient {
                         .header("Content-Type", "application/json")
                         .body(Body::from(
                             json!({
-                                "uuid": node.uuid.to_string(),
-                                "address": node.address.to_string(),
-                                "az": node.az.to_string(),
-                                "role": node.role.to_string(),
+                                "me": node,
+                                "roles": roles,
                             })
                             .to_string()
                             .as_bytes()
@@ -206,6 +216,30 @@ impl LeaderClient {
               _ = tokio::time::sleep(config.gossip_interval) => {}
             }
         }
+    }
+
+    pub async fn shutdown(self) -> Result<()> {
+        // stop gossip
+        self.gossip_task.abort();
+
+        // if we are still connected to the leader, signal cleanly that we are going down
+        if let Some(sender) = self.sender.lock().await.as_mut() {
+            let req = Request::builder()
+                .uri("/_lbc/gossip")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "leaving": self.node,
+                    })
+                    .to_string()
+                    .as_bytes()
+                    .to_vec(),
+                ))
+                .unwrap();
+            sender.send_request(req).await?;
+        }
+
+        Ok(())
     }
 
     async fn open_client(addr: SocketAddr) -> Result<(SendRequest<Body>, Http2Connection)> {
