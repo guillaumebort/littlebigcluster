@@ -4,7 +4,7 @@ use anyhow::Result;
 use axum::{debug_handler, extract::State, routing::get, Json, Router};
 use futures::future::BoxFuture;
 use object_store::ObjectStore;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{Executor, Sqlite, SqlitePool};
 use tokio::{
     select,
@@ -18,6 +18,7 @@ use crate::{
     client::LeaderClient,
     config::Config,
     db::DB,
+    members::{Member, Members, Membership},
     replica::Replica,
     server::{JsonResponse, Server},
     Node,
@@ -71,6 +72,8 @@ pub trait Follower {
 
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>>;
 
+    fn watch_members(&self) -> &watch::Receiver<Members>;
+
     fn watch_epoch(&self) -> &watch::Receiver<u32>;
 
     fn db(&self) -> impl Executor<Database = Sqlite>;
@@ -99,6 +102,7 @@ pub struct FollowerNode {
     watch_leader_node: watch::Receiver<Option<Node>>,
     watch_epoch: watch::Receiver<u32>,
     leader_client: LeaderClient,
+    membership: Membership,
     server: Server,
     #[allow(unused)]
     cancel: DropGuard,
@@ -114,8 +118,20 @@ impl FollowerNode {
     ) -> Result<Self> {
         debug!(?node, "Joining cluster as follower");
 
+        // Bind server
+        let tcp_listener = Server::bind(&mut node).await?;
+
         // Open the replica
         let replica = Replica::open(&node.cluster_id, object_store.clone(), config.clone()).await?;
+
+        // Track membership
+        let membership = Membership::new(
+            Member {
+                node: node.clone(),
+                roles: roles.clone(),
+            },
+            config.clone(),
+        );
 
         // Get a read only db
         let db: DB = replica.db().clone();
@@ -135,7 +151,7 @@ impl FollowerNode {
             .nest("/_lbc", system_router)
             .merge(router)
             .with_state(state);
-        let server = Server::start(&mut node, router).await?;
+        let server = Server::start(tcp_listener, router).await?;
 
         // Keep the replica up-to-date until the follower is dropped
         let cancel = CancellationToken::new();
@@ -148,8 +164,13 @@ impl FollowerNode {
         ));
 
         // Start an http2 client always connected to the current leader
-        let leader_client =
-            LeaderClient::new(node.clone(), roles, watch_leader_node.clone(), config);
+        let leader_client = LeaderClient::new(
+            node.clone(),
+            roles,
+            watch_leader_node.clone(),
+            membership.clone(),
+            config,
+        );
 
         Ok(Self {
             node,
@@ -158,6 +179,7 @@ impl FollowerNode {
             watch_leader_node,
             watch_epoch,
             leader_client,
+            membership,
             server,
             cancel: cancel.drop_guard(),
         })
@@ -217,6 +239,10 @@ impl Follower for FollowerNode {
         self.leader_client.shutdown().await?;
 
         Ok(())
+    }
+
+    fn watch_members(&self) -> &watch::Receiver<Members> {
+        self.membership.watch()
     }
 
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>> {
@@ -291,7 +317,7 @@ impl Follower for FollowerNode {
 }
 
 #[debug_handler]
-async fn status(State(state): State<ClusterState>) -> JsonResponse {
+async fn status(State(state): State<ClusterState>) -> JsonResponse<Value> {
     let replica = state.replica();
     let replica = replica.read().await;
     Ok(Json(json!({

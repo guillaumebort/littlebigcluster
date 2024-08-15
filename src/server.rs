@@ -14,7 +14,7 @@ use futures::FutureExt;
 use itertools::Itertools;
 use pnet::ipnetwork::IpNetwork;
 use serde_json::json;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tracing::{debug, error};
 
 use crate::Node;
@@ -27,18 +27,9 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn start(node: &mut Node, router: Router) -> Result<Self> {
+    pub async fn bind(node: &mut Node) -> Result<TcpListener> {
         let listener = tokio::net::TcpListener::bind(node.address).await?;
         let mut address = listener.local_addr()?;
-
-        let (notify_shutdown, on_shutdow) = tokio::sync::oneshot::channel();
-        let serve = tokio::spawn(
-            axum::serve(listener, router)
-                .with_graceful_shutdown(on_shutdow.map(|_| ()))
-                .into_future(),
-        );
-
-        debug!(?address, "Started server");
 
         // Fix the node address with the correct server address to advertise
         if address.ip().is_unspecified() {
@@ -49,6 +40,20 @@ impl Server {
             }
         }
         node.address = address;
+
+        Ok(listener)
+    }
+
+    pub async fn start(listener: TcpListener, router: Router) -> Result<Self> {
+        let address = listener.local_addr()?;
+        let (notify_shutdown, on_shutdow) = tokio::sync::oneshot::channel();
+        let serve = tokio::spawn(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(on_shutdow.map(|_| ()))
+                .into_future(),
+        );
+
+        debug!(?address, "Started server");
 
         Ok(Self {
             address,
@@ -67,7 +72,7 @@ impl Server {
     }
 }
 
-pub type JsonResponse = Result<Json<serde_json::Value>, ServerError>;
+pub type JsonResponse<A> = Result<Json<A>, ServerError>;
 
 pub struct ServerError(anyhow::Error);
 

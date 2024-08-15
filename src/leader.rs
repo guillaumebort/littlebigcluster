@@ -4,24 +4,24 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::{
     debug_handler,
     extract::{Request, State},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
 use futures::future::BoxFuture;
 use hyper::StatusCode;
 use object_store::ObjectStore;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, Transaction};
 use tokio::{
     select,
-    sync::{watch, Notify, RwLock},
+    sync::{futures::Notified, watch, Notify, RwLock},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
@@ -31,6 +31,7 @@ use crate::{
     config::Config,
     db::{Ack, DB},
     follower::ClusterState,
+    members::{Gossip, Member, Members, Membership},
     replica::Replica,
     server::{JsonResponse, Server},
     Node,
@@ -42,7 +43,10 @@ struct LeaderStateInner {
     roles: Vec<String>,
     leader_status: LeaderStatus,
     replica: Arc<RwLock<Replica>>,
+    membership: Membership,
+    graceful_shutdown: Arc<Notify>,
     db: DB,
+    config: Config,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +60,9 @@ impl LeaderState {
         roles: Vec<String>,
         leader_status: LeaderStatus,
         replica: Arc<RwLock<Replica>>,
+        membership: Membership,
+        graceful_shutdown: Arc<Notify>,
+        config: Config,
     ) -> Self {
         let db = replica.read().await.db().clone();
         Self {
@@ -64,9 +71,20 @@ impl LeaderState {
                 roles,
                 leader_status,
                 replica,
+                membership,
+                graceful_shutdown,
                 db,
+                config,
             }),
         }
+    }
+
+    pub fn shutdown(&self) -> Notified {
+        self.inner.graceful_shutdown.notified()
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.inner.config
     }
 
     pub fn this(&self) -> &Node {
@@ -117,6 +135,8 @@ impl LeaderState {
 
 pub trait Leader {
     fn shutdown(self) -> impl Future<Output = Result<()>>;
+
+    fn watch_members(&self) -> &watch::Receiver<Members>;
 
     fn lost_leadership(&self) -> impl Future<Output = ()>;
 
@@ -186,7 +206,9 @@ pub struct LeaderNode {
     object_store: Arc<dyn ObjectStore>,
     server: Server,
     leader_status: LeaderStatus,
+    membership: Membership,
     roles: Vec<String>,
+    graceful_shutdown: Arc<Notify>,
     config: Config,
     cancel: DropGuard,
 }
@@ -201,12 +223,29 @@ impl LeaderNode {
         config: Config,
     ) -> Result<Self> {
         debug!(?node, "Joining cluster as Leader");
+
+        // Bind the server
+        let tcp_listener = Server::bind(&mut node).await?;
+
+        // Keep track of leadership status
         let leader_status = LeaderStatus::new();
 
         // Open the replica
         let replica = Replica::open(&node.cluster_id, object_store.clone(), config.clone()).await?;
         let db: DB = replica.db().clone();
         let replica = Arc::new(RwLock::new(replica));
+
+        // Track membership
+        let membership = Membership::new(
+            Member {
+                node: node.clone(),
+                roles: roles.clone(),
+            },
+            config.clone(),
+        );
+
+        // For graceful shutdown
+        let graceful_shutdown = Arc::new(Notify::new());
 
         // Start the server
         let leader_router = {
@@ -215,11 +254,14 @@ impl LeaderNode {
                 roles.clone(),
                 leader_status.clone(),
                 replica.clone(),
+                membership.clone(),
+                graceful_shutdown.clone(),
+                config.clone(),
             )
             .await;
             let system_router = Router::new()
                 .route("/status", get(status))
-                .route("/gossip", get(gossip));
+                .route("/gossip", post(gossip));
             let router = Router::new()
                 .nest("/_lbc", system_router)
                 .merge(router)
@@ -230,7 +272,7 @@ impl LeaderNode {
             let state = ClusterState::new(node.clone(), roles.clone(), replica.clone()).await;
             additional_router.with_state(state)
         };
-        let server = Server::start(&mut node, leader_router.merge(additional_router)).await?;
+        let server = Server::start(tcp_listener, leader_router.merge(additional_router)).await?;
 
         // drop guard so we stop everything when the leader is dropped
         let cancel = CancellationToken::new().drop_guard();
@@ -243,6 +285,8 @@ impl LeaderNode {
             server,
             leader_status,
             roles,
+            membership,
+            graceful_shutdown,
             config,
             cancel,
         })
@@ -286,6 +330,7 @@ impl StandByLeader for LeaderNode {
             self.node.clone(),
             self.roles.clone(),
             watch_leader_node.clone(),
+            self.membership.clone(),
             self.config.clone(),
         );
 
@@ -308,7 +353,8 @@ impl StandByLeader for LeaderNode {
 
             // If there is no leader OR the leader is stale
             if current_leader.is_none()
-                || (Utc::now() - last_update) > chrono::Duration::seconds(10)
+                || (Utc::now() - last_update).to_std().unwrap_or_default()
+                    > self.config.session_timeout
             {
                 debug!(
                     ?current_leader,
@@ -359,6 +405,9 @@ impl StandByLeader for LeaderNode {
 
 impl Leader for LeaderNode {
     async fn shutdown(mut self) -> Result<()> {
+        // Notify everyone we are shutting down
+        self.graceful_shutdown.notify_waiters();
+
         // Gracefully shutdown the server
         self.server.shutdown().await?;
 
@@ -427,6 +476,10 @@ impl Leader for LeaderNode {
     fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object_store
     }
+
+    fn watch_members(&self) -> &watch::Receiver<Members> {
+        self.membership.watch()
+    }
 }
 
 async fn leader_only(State(state): State<LeaderState>, request: Request, next: Next) -> Response {
@@ -459,9 +512,8 @@ async fn leader_only(State(state): State<LeaderState>, request: Request, next: N
 }
 
 #[debug_handler]
-async fn status(State(state): State<LeaderState>) -> JsonResponse {
-    let replica = state.replica();
-    let replica = replica.read().await;
+async fn status(State(state): State<LeaderState>) -> JsonResponse<Value> {
+    let replica = state.inner.replica.read().await;
     Ok(Json(json!({
         "this": state.this(),
         "roles": state.roles(),
@@ -482,8 +534,37 @@ async fn status(State(state): State<LeaderState>) -> JsonResponse {
 #[debug_handler]
 async fn gossip(
     State(state): State<LeaderState>,
-    Json(payload): Json<serde_json::Value>,
-) -> JsonResponse {
-    dbg!(payload);
-    Ok(Json(json!("ok")))
+    Json(payload): Json<Gossip>,
+) -> JsonResponse<Gossip> {
+    match payload {
+        Gossip::Alive {
+            member,
+            known_members_hash,
+        } => {
+            state
+                .inner
+                .membership
+                .update(vec![(Utc::now(), member)], vec![]);
+
+            if known_members_hash == state.inner.membership.watch().borrow().hash {
+                let mut watch_members = state.inner.membership.watch().clone();
+                let members_changed =
+                    watch_members.wait_for(|members| known_members_hash != members.hash);
+                select! {
+                    _ = members_changed => {}
+                    _ = tokio::time::sleep(state.config().session_timeout / 2) => {}
+                    _ = state.inner.graceful_shutdown.notified() => {
+                        state.inner.membership.update(vec![], vec![state.this().clone()]);
+                    }
+                }
+            }
+
+            Ok(Json(state.inner.membership.rumors()))
+        }
+        Gossip::Dead { node } => {
+            state.inner.membership.update(vec![], vec![node]);
+            Ok(Json(Gossip::GoodBye))
+        }
+        _ => Err(anyhow!("Unexpected gossip message"))?,
+    }
 }

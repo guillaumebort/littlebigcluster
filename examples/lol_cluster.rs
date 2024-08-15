@@ -1,9 +1,10 @@
 use std::{net::SocketAddr, time::Duration};
 
 use anyhow::Result;
+use ascii_table::AsciiTable;
 use clap::{Parser, Subcommand};
 use futures::{select, FutureExt};
-use littlebigcluster::{Config, Follower, Leader, LittleBigCluster, StandByLeader};
+use littlebigcluster::{Config, Follower, Leader, LittleBigCluster, Members, StandByLeader};
 use object_store::local::LocalFileSystem;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{
@@ -140,7 +141,7 @@ fn open_cluster(cluster_id: &str, path: &std::path::Path) -> Result<LittleBigClu
             epoch_interval: Duration::from_secs(1),
             snapshot_interval: Duration::from_secs(30),
             snapshots_to_keep: 5,
-            gossip_interval: Duration::from_secs(1),
+            session_timeout: Duration::from_secs(20),
         },
     )
 }
@@ -181,6 +182,8 @@ mod follower {
         let value: Option<String> = watch_value.borrow_and_update().clone();
         info!(?leader, ?value);
 
+        let mut watch_members = follower.watch_members().clone();
+
         loop {
             select! {
                 _ = watch_leader.changed().fuse() => {
@@ -192,6 +195,10 @@ mod follower {
                 _ = watch_value.changed().fuse() => {
                     let value: Option<String> = watch_value.borrow_and_update().clone();
                     info!(?value, "Value changed!");
+                }
+
+                _ = watch_members.changed().fuse() => {
+                    print_members(&*watch_members.borrow_and_update());
                 }
 
                 _ = wait_exit_signal().fuse() => {
@@ -248,17 +255,27 @@ mod leader {
 
         info!("Listening on http://{}", leader.address());
 
-        select! {
-            _ = wait_exit_signal().fuse() => {
-                info!("Shutting down...");
-            }
-            _ = leader.lost_leadership().fuse() => {
-                warn!("Lost leadership!?");
+        let mut watch_members = leader.watch_members().clone();
+
+        loop {
+            select! {
+                _ = wait_exit_signal().fuse() => {
+                    info!("Shutting down...");
+                    leader.shutdown().await?;
+                    info!("Exited gracefully");
+                    break;
+                }
+
+                _ = watch_members.changed().fuse() => {
+                    print_members(&*watch_members.borrow_and_update());
+                }
+
+                _ = leader.lost_leadership().fuse() => {
+                    warn!("Lost leadership!?");
+                    break;
+                }
             }
         }
-
-        leader.shutdown().await?;
-        info!("Exited gracefully");
 
         Ok(())
     }
@@ -334,4 +351,24 @@ async fn wait_exit_signal() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_members(members: &Members) {
+    let members = members.to_vec();
+    let mut ascii_table = AsciiTable::default();
+    ascii_table.column(0).set_header("UUID");
+    ascii_table.column(1).set_header("Address");
+    ascii_table.column(2).set_header("AZ");
+    ascii_table.column(3).set_header("Roles");
+    let mut data = Vec::with_capacity(members.len());
+    for member in members {
+        data.push(vec![
+            member.node.uuid.to_string(),
+            member.node.address.to_string(),
+            member.node.az.to_string(),
+            member.roles.join(", "),
+        ]);
+    }
+    let members = ascii_table.format(data);
+    info!("Members changed\n{}", members);
 }

@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod follower;
 mod leader;
+mod members;
 mod replica;
 mod server;
 
@@ -15,30 +16,9 @@ pub use follower::Follower;
 use follower::{ClusterState, FollowerNode};
 use leader::LeaderNode;
 pub use leader::{Leader, LeaderState, LeaderStatus, StandByLeader};
+pub use members::{Member, Members, Node};
 use object_store::ObjectStore;
 use replica::Replica;
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Node {
-    pub uuid: Uuid,
-    pub cluster_id: String,
-    pub az: String,
-    pub address: SocketAddr,
-}
-
-impl Node {
-    pub fn new(cluster_id: String, az: String, address: SocketAddr) -> Self {
-        let uuid = Uuid::now_v7();
-        Self {
-            uuid,
-            cluster_id,
-            az,
-            address,
-        }
-    }
-}
 
 pub struct LittleBigCluster {
     cluster_id: String,
