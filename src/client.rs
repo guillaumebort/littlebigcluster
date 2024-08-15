@@ -17,7 +17,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{Config, Node};
 
