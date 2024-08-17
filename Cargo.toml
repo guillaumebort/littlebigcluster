@@ -23,11 +23,13 @@ axum = { version = "0.7", features = ["http2", "macros"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 hyper = { version = "1.4", features = ["http2", "client"] }
 hyper-util = "0.1.8"
-pnet = "0.35.0"
-itertools = "0.13.0"
+pnet = "0.35"
+itertools = "0.13"
+parking_lot = "0.12"
 
 [dev-dependencies]
 rand = "0.8.5"
 clap = { version = "4.3.21", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["ansi"] }
-ascii_table = "4.0.4"
+ascii_table = { version = "4.0.4", features = ["color_codes"] }
+colored = "2.1.0"

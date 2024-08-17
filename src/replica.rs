@@ -8,7 +8,6 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use object_store::{path::Path, ObjectStore, PutMode, PutOptions};
-use sqlx::Row;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, trace};
@@ -19,8 +18,8 @@ use crate::{config::Config, db::DB, Node};
 #[derive(Debug)]
 pub(crate) struct Replica {
     pub object_store: Arc<dyn ObjectStore>,
-    snapshot_epoch: u32,
-    epoch: u32,
+    snapshot_epoch: u64,
+    epoch: u64,
     db: DB,
     config: Config,
 }
@@ -106,9 +105,6 @@ impl Replica {
                             .bind(cluster_id)
                             .execute(&mut *txn)
                             .await?;
-                        sqlx::query(r#"INSERT INTO _lbc VALUES ('epoch', 0)"#)
-                            .execute(&mut *txn)
-                            .await?;
                         sqlx::query(r#"INSERT INTO _lbc VALUES ('last_update', ?1)"#)
                             .bind(Utc::now().to_rfc3339())
                             .execute(&mut *txn)
@@ -143,11 +139,11 @@ impl Replica {
         Ok(())
     }
 
-    pub fn epoch(&self) -> u32 {
+    pub fn epoch(&self) -> u64 {
         self.epoch
     }
 
-    pub fn snapshot_epoch(&self) -> u32 {
+    pub fn snapshot_epoch(&self) -> u64 {
         self.snapshot_epoch
     }
 
@@ -197,8 +193,8 @@ impl Replica {
     /// Try to increment the epoch and create a new WAL
     /// This is an atomic operation that only the current leader is allowed to do
     /// If there is a conflict it means that the current node is not the leader anymore
-    pub async fn incr_epoch(&mut self) -> Result<u32> {
-        let next_epoch = self.epoch + 1;
+    pub async fn incr_epoch(&mut self) -> Result<u64> {
+        let next_epoch = self.next_epoch()?;
         let object_store = self.object_store.clone();
 
         // Snapshot if needed
@@ -210,10 +206,6 @@ impl Replica {
             .db
             .transaction(move |mut txn| {
                 async move {
-                    sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'epoch'"#)
-                        .bind(next_epoch)
-                        .execute(&mut *txn)
-                        .await?;
                     sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'last_update'"#)
                         .bind(Utc::now().to_rfc3339())
                         .execute(&mut *txn)
@@ -289,7 +281,7 @@ impl Replica {
 
     /// Attempt to change the leader for the next epoch
     pub async fn try_change_leader(&mut self, new_leader: Option<Node>) -> Result<()> {
-        let next_epoch = self.epoch + 1;
+        let next_epoch = self.next_epoch()?;
 
         // mark us as leader in the DB
         let leader_ack = self.db.transaction(move |mut txn| async move {
@@ -309,7 +301,6 @@ impl Replica {
                 sqlx::query(r#"DELETE FROM _lbc WHERE key = 'leader'"#).execute(&mut *txn).await?;
             }
 
-            sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'epoch'"#).bind(next_epoch).execute(&mut *txn).await?;
             sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'last_update'"#).bind(Utc::now().to_rfc3339()).execute(&mut *txn).await?;
 
             txn.commit().await
@@ -343,14 +334,20 @@ impl Replica {
         }
     }
 
+    fn next_epoch(&self) -> Result<u64> {
+        self.epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("epoch overflow"))
+    }
+
     /// Attempt to refresh the replica by applying the next WAL
     /// Lookup for the next epoch WAL and apply it if it exists
     pub async fn refresh(&mut self) -> Result<()> {
         while let Some(wal) =
-            Self::get_if_exists(&self.object_store, Self::wal_path(self.epoch + 1)).await?
+            Self::get_if_exists(&self.object_store, Self::wal_path(self.next_epoch()?)).await?
         {
             self.db.apply_wal(wal.path()).await?;
-            self.epoch += 1;
+            self.epoch = self.next_epoch()?;
             trace!(epoch = self.epoch, "Refreshed replica");
         }
         Ok(())
@@ -362,7 +359,7 @@ impl Replica {
             bail!("TODO: current_epoch < self.epoch")
         } else {
             let mut wals = FuturesOrdered::new();
-            for epoch in (self.epoch + 1)..=current_epoch {
+            for epoch in (self.next_epoch()?)..=current_epoch {
                 let wal_path = Self::wal_path(epoch);
                 wals.push_back(Self::get(&self.object_store, wal_path).map(move |o| (epoch, o)));
             }
@@ -385,7 +382,7 @@ impl Replica {
                 .location
                 .filename()
                 .and_then(|filename| filename.strip_suffix(".db"))
-                .and_then(|filename| filename.parse::<u32>().ok())
+                .and_then(|filename| filename.parse::<u64>().ok())
             {
                 snaphost_epochs.push(epoch);
             }
@@ -432,7 +429,7 @@ impl Replica {
                 .location
                 .filename()
                 .and_then(|filename| filename.strip_suffix(".wal"))
-                .and_then(|filename| filename.parse::<u32>().ok())
+                .and_then(|filename| filename.parse::<u64>().ok())
             {
                 if epoch < latest_snapshot_epoch {
                     let path = wal.location;
@@ -502,19 +499,19 @@ impl Replica {
         Ok(())
     }
 
-    fn snapshot_path(epoch: u32) -> Path {
-        Path::from(Self::SNAPSHOT_PATH).child(format!("{:010}.db", epoch))
+    fn snapshot_path(epoch: u64) -> Path {
+        Path::from(Self::SNAPSHOT_PATH).child(format!("{:020}.db", epoch))
     }
 
-    fn wal_path(epoch: u32) -> Path {
-        Path::from(Self::WAL_PATH).child(format!("{:010}.wal", epoch))
+    fn wal_path(epoch: u64) -> Path {
+        Path::from(Self::WAL_PATH).child(format!("{:020}.wal", epoch))
     }
 
-    async fn latest_snapshot_epoch(object_store: &impl ObjectStore) -> Result<u32> {
+    async fn latest_snapshot_epoch(object_store: &impl ObjectStore) -> Result<u64> {
         Self::latest_epoch(object_store, &Path::from(Self::SNAPSHOT_PATH), ".db").await
     }
 
-    async fn latest_wal_epoch(object_store: &impl ObjectStore) -> Result<u32> {
+    async fn latest_wal_epoch(object_store: &impl ObjectStore) -> Result<u64> {
         Self::latest_epoch(object_store, &Path::from(Self::WAL_PATH), ".wal").await
     }
 
@@ -522,9 +519,9 @@ impl Replica {
         object_store: &impl ObjectStore,
         path: &Path,
         suffix: &str,
-    ) -> Result<u32> {
+    ) -> Result<u64> {
         let mut items = object_store.list(Some(&path));
-        let mut current_epoch: Option<u32> = None;
+        let mut current_epoch: Option<u64> = None;
         while let Some(manifest) = match items.next().await.transpose() {
             Ok(file) => file,
             Err(e) => bail!("Failed to list objects: {}", e),

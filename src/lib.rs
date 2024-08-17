@@ -1,11 +1,12 @@
-mod client;
 mod config;
 mod db;
 mod follower;
+mod gossip;
+mod http2_client;
+mod http2_server;
 mod leader;
-mod members;
+mod leader_client;
 mod replica;
-mod server;
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -14,9 +15,9 @@ use axum::Router;
 pub use config::Config;
 pub use follower::Follower;
 use follower::{ClusterState, FollowerNode};
+pub use gossip::{Member, Members, Node};
 use leader::LeaderNode;
 pub use leader::{Leader, LeaderState, LeaderStatus, StandByLeader};
-pub use members::{Member, Members, Node};
 use object_store::ObjectStore;
 use replica::Replica;
 

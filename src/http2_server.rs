@@ -1,8 +1,4 @@
-use std::{
-    future::IntoFuture,
-    net::{IpAddr, SocketAddr},
-    sync::OnceLock,
-};
+use std::{future::IntoFuture, net::IpAddr, sync::OnceLock};
 
 use anyhow::{anyhow, bail, Result};
 use axum::{
@@ -21,7 +17,6 @@ use crate::Node;
 
 #[derive(Debug)]
 pub struct Server {
-    pub address: SocketAddr,
     notify_shutdown: oneshot::Sender<()>,
     serve: JoinHandle<Result<(), std::io::Error>>,
 }
@@ -33,7 +28,7 @@ impl Server {
 
         // Fix the node address with the correct server address to advertise
         if address.ip().is_unspecified() {
-            if let Some(ip) = find_ip_address() {
+            if let Some(ip) = best_ip_address() {
                 address.set_ip(ip);
             } else {
                 bail!("Cannot advertise {} as IP address", address.ip());
@@ -56,7 +51,6 @@ impl Server {
         debug!(?address, "Started server");
 
         Ok(Self {
-            address,
             notify_shutdown,
             serve,
         })
@@ -97,7 +91,49 @@ where
 }
 
 // Find the best non-local IP address
-fn find_ip_address() -> Option<IpAddr> {
+fn best_ip_address() -> Option<IpAddr> {
+    fn is_forwardable_ip(ip_addr: &IpAddr) -> bool {
+        static NON_FORWARDABLE_NETWORKS: OnceLock<Vec<IpNetwork>> = OnceLock::new();
+        NON_FORWARDABLE_NETWORKS
+            .get_or_init(|| {
+                [
+                    "0.0.0.0/8",
+                    "127.0.0.0/8",
+                    "169.254.0.0/16",
+                    "192.0.0.0/24",
+                    "192.0.2.0/24",
+                    "198.51.100.0/24",
+                    "2001:10::/28",
+                    "2001:db8::/32",
+                    "203.0.113.0/24",
+                    "240.0.0.0/4",
+                    "255.255.255.255/32",
+                    "::/128",
+                    "::1/128",
+                    "::ffff:0:0/96",
+                    "fe80::/10",
+                ]
+                .iter()
+                .map(|network| network.parse().unwrap())
+                .collect()
+            })
+            .iter()
+            .all(|network| !network.contains(*ip_addr))
+    }
+
+    fn is_private_ip(ip_addr: &IpAddr) -> bool {
+        static PRIVATE_NETWORKS: OnceLock<Vec<IpNetwork>> = OnceLock::new();
+        PRIVATE_NETWORKS
+            .get_or_init(|| {
+                ["192.168.0.0/16", "172.16.0.0/12", "10.0.0.0/8", "fc00::/7"]
+                    .iter()
+                    .map(|network| network.parse().unwrap())
+                    .collect()
+            })
+            .iter()
+            .any(|network| network.contains(*ip_addr))
+    }
+
     pnet::datalink::interfaces()
         .iter()
         .filter(|interface| interface.is_up())
@@ -117,46 +153,4 @@ fn find_ip_address() -> Option<IpAddr> {
         })
         .next()
         .map(|(_, ip_net)| ip_net.ip())
-}
-
-fn is_forwardable_ip(ip_addr: &IpAddr) -> bool {
-    static NON_FORWARDABLE_NETWORKS: OnceLock<Vec<IpNetwork>> = OnceLock::new();
-    NON_FORWARDABLE_NETWORKS
-        .get_or_init(|| {
-            [
-                "0.0.0.0/8",
-                "127.0.0.0/8",
-                "169.254.0.0/16",
-                "192.0.0.0/24",
-                "192.0.2.0/24",
-                "198.51.100.0/24",
-                "2001:10::/28",
-                "2001:db8::/32",
-                "203.0.113.0/24",
-                "240.0.0.0/4",
-                "255.255.255.255/32",
-                "::/128",
-                "::1/128",
-                "::ffff:0:0/96",
-                "fe80::/10",
-            ]
-            .iter()
-            .map(|network| network.parse().unwrap())
-            .collect()
-        })
-        .iter()
-        .all(|network| !network.contains(*ip_addr))
-}
-
-fn is_private_ip(ip_addr: &IpAddr) -> bool {
-    static PRIVATE_NETWORKS: OnceLock<Vec<IpNetwork>> = OnceLock::new();
-    PRIVATE_NETWORKS
-        .get_or_init(|| {
-            ["192.168.0.0/16", "172.16.0.0/12", "10.0.0.0/8", "fc00::/7"]
-                .iter()
-                .map(|network| network.parse().unwrap())
-                .collect()
-        })
-        .iter()
-        .any(|network| network.contains(*ip_addr))
 }

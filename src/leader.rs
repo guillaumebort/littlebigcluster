@@ -27,13 +27,13 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
 
 use crate::{
-    client::LeaderClient,
     config::Config,
     db::{Ack, DB},
     follower::ClusterState,
-    members::{Gossip, Member, Members, Membership},
+    gossip::{Gossip, Member, Members, Membership},
+    http2_server::{JsonResponse, Server},
+    leader_client::LeaderClient,
     replica::Replica,
-    server::{JsonResponse, Server},
     Node,
 };
 
@@ -163,6 +163,8 @@ pub trait Leader {
     ) -> impl Future<Output = Result<Ack<SqliteQueryResult>>>;
 
     fn object_store(&self) -> &Arc<dyn ObjectStore>;
+
+    fn node(&self) -> &Node;
 }
 
 pub trait StandByLeader {
@@ -207,7 +209,6 @@ pub struct LeaderNode {
     server: Server,
     leader_status: LeaderStatus,
     membership: Membership,
-    roles: Vec<String>,
     graceful_shutdown: Arc<Notify>,
     config: Config,
     cancel: DropGuard,
@@ -284,7 +285,6 @@ impl LeaderNode {
             object_store,
             server,
             leader_status,
-            roles,
             membership,
             graceful_shutdown,
             config,
@@ -326,13 +326,14 @@ impl StandByLeader for LeaderNode {
         // HTTP client connected to the leader
         let (leader_updates, watch_leader_node) =
             watch::channel(self.replica.read().await.leader().await?);
-        let _leader_client = LeaderClient::new(
-            self.node.clone(),
-            self.roles.clone(),
-            watch_leader_node.clone(),
+
+        #[allow(unused)]
+        let leader_client = LeaderClient::new(
             self.membership.clone(),
+            watch_leader_node.clone(),
             self.config.clone(),
-        );
+        )
+        .await;
 
         loop {
             let mut replica = self.replica.write().await;
@@ -444,11 +445,15 @@ impl Leader for LeaderNode {
     }
 
     fn address(&self) -> SocketAddr {
-        self.server.address
+        self.node.address
     }
 
     fn db(&self) -> impl Executor<Database = Sqlite> {
         self.db.read_pool()
+    }
+
+    fn node(&self) -> &Node {
+        &self.node
     }
 
     async fn transaction<A, E>(
@@ -528,6 +533,7 @@ async fn status(State(state): State<LeaderState>) -> JsonResponse<Value> {
             "size": tokio::fs::metadata(replica.db().path()).await?.len(),
         },
         "is_leader": state.is_leader(),
+        "members": state.inner.membership.rumors(),
     })))
 }
 

@@ -3,14 +3,16 @@ use std::{net::SocketAddr, time::Duration};
 use anyhow::Result;
 use ascii_table::AsciiTable;
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use futures::{select, FutureExt};
-use littlebigcluster::{Config, Follower, Leader, LittleBigCluster, Members, StandByLeader};
+use littlebigcluster::{Config, Follower, Leader, LittleBigCluster, Members, Node, StandByLeader};
 use object_store::local::LocalFileSystem;
-use tracing::{debug, error, info, warn, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::{
     layer::{Layer, SubscriberExt},
     util::SubscriberInitExt,
 };
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -36,6 +38,9 @@ struct Args {
     #[arg(long)]
     #[clap(default_value = "default")]
     az: String,
+
+    #[arg(short, long)]
+    roles: Vec<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -78,7 +83,7 @@ pub async fn main() {
                             Level::WARN | Level::ERROR => true,
                             Level::INFO | Level::DEBUG
                                 if metadata.target().starts_with("lol_cluster")
-                                    || metadata.target().starts_with("littlecluster") =>
+                                    || metadata.target().starts_with("littlebigcluster") =>
                             {
                                 true
                             }
@@ -93,13 +98,7 @@ pub async fn main() {
                     .event_format(tracing_subscriber::fmt::format().pretty())
                     .with_filter(tracing_subscriber::filter::filter_fn(
                         |metadata| match *metadata.level() {
-                            Level::WARN | Level::ERROR | Level::INFO => true,
-                            Level::DEBUG | Level::TRACE
-                                if metadata.target().starts_with("lol_cluster")
-                                    || metadata.target().starts_with("littlecluster") =>
-                            {
-                                true
-                            }
+                            Level::WARN | Level::ERROR | Level::INFO | Level::DEBUG => true,
                             _ => false,
                         },
                     )),
@@ -123,8 +122,8 @@ pub async fn main() {
 
     let command_result = match args.command {
         Command::Init => init_cluster(&cluster).await,
-        Command::Leader => leader::join(cluster, args.az, args.address).await,
-        Command::Follower => follower::join(cluster, args.az, args.address).await,
+        Command::Leader => leader::join(cluster, args.az, args.address, args.roles).await,
+        Command::Follower => follower::join(cluster, args.az, args.address, args.roles).await,
     };
 
     if let Err(err) = command_result {
@@ -151,54 +150,50 @@ async fn init_cluster(cluster: &LittleBigCluster) -> Result<()> {
 }
 
 mod follower {
+    use axum::Router;
     use futures::FutureExt;
     use tokio::select;
 
     use super::*;
 
-    pub async fn join(cluster: LittleBigCluster, az: String, address: SocketAddr) -> Result<()> {
+    pub async fn join(
+        cluster: LittleBigCluster,
+        az: String,
+        address: SocketAddr,
+        roles: Vec<String>,
+    ) -> Result<()> {
         info!("Joining cluster as follower...");
-        let follower = cluster.join_as_follower(az, address, vec![]).await?;
+        let follower = cluster
+            .join_as_follower(
+                az,
+                address,
+                roles
+                    .into_iter()
+                    .map(|role| (role, Router::new()))
+                    .collect(),
+            )
+            .await?;
         info!("Joined cluster!");
         info!("Listening on http://{}", follower.address());
 
         let mut watch_leader = follower.watch_leader().clone();
-        let mut watch_value = follower
-            .watch(|_epoc, db, _object_store| {
-                async move {
-                    let value: Option<String> = sqlx::query_scalar(
-                        r#"SELECT value FROM all_values ORDER BY id DESC LIMIT 1"#,
-                    )
-                    .fetch_optional(db)
-                    .await?;
-                    debug!(?value);
-                    Ok(value)
-                }
-                .boxed()
-            })
-            .await?;
-
-        let leader = watch_leader.borrow_and_update().clone();
-        let value: Option<String> = watch_value.borrow_and_update().clone();
-        info!(?leader, ?value);
-
         let mut watch_members = follower.watch_members().clone();
+
+        print_members(
+            follower.node().uuid,
+            &*watch_members.borrow_and_update(),
+            &*watch_leader.borrow_and_update(),
+        );
 
         loop {
             select! {
-                _ = watch_leader.changed().fuse() => {
-                    let leader = watch_leader.borrow_and_update().clone();
-                    let value: Option<String> = watch_value.borrow().clone();
-                    info!(?leader, ?value, "Leader changed!");
-                }
 
-                _ = watch_value.changed().fuse() => {
-                    let value: Option<String> = watch_value.borrow_and_update().clone();
-                    info!(?value, "Value changed!");
+                _ = watch_leader.changed().fuse() => {
+                    print_members(follower.node().uuid, &*watch_members.borrow_and_update(), &*watch_leader.borrow_and_update());
                 }
 
                 _ = watch_members.changed().fuse() => {
-                    print_members(&*watch_members.borrow_and_update());
+                    print_members(follower.node().uuid, &*watch_members.borrow_and_update(), &*watch_leader.borrow_and_update());
                 }
 
                 _ = wait_exit_signal().fuse() => {
@@ -216,127 +211,63 @@ mod follower {
 }
 
 mod leader {
-    use std::collections::HashMap;
 
-    use axum::{
-        extract::{Query, State},
-        response::{IntoResponse, Response},
-        routing::{get, post},
-        Json,
-    };
-    use hyper::StatusCode;
-    use littlebigcluster::LeaderState;
-    use serde_json::json;
+    use axum::{routing::get, Router};
 
     use super::*;
 
-    pub async fn join(cluster: LittleBigCluster, az: String, address: SocketAddr) -> Result<()> {
-        let router = axum::Router::new()
-            .route("/value/set", post(set_value))
-            .route("/value/get", get(get_value));
+    pub async fn join(
+        cluster: LittleBigCluster,
+        az: String,
+        address: SocketAddr,
+        roles: Vec<String>,
+    ) -> Result<()> {
+        let router =
+            axum::Router::new().route("/hello", get(|| async { "Hello from the leader!" }));
 
-        let standby = cluster.join_as_leader(az, address, router, vec![]).await?;
-        info!("Joined cluster! Waiting for leadership...");
+        let standby = cluster
+            .join_as_leader(
+                az,
+                address,
+                router,
+                roles
+                    .into_iter()
+                    .map(|role| (role, Router::new()))
+                    .collect(),
+            )
+            .await?;
+        info!("Waiting for leadership...");
 
         let leader = standby.wait_for_leadership().await?;
         info!("We are the new leader!");
-
-        // ensure that the leader schema is created (a real application would use sqlx migrations)
-        let _ = leader
-            .execute_batch(sqlx::raw_sql(
-                r#"
-                CREATE TABLE IF NOT EXISTS all_values (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    value TEXT NOT NULL
-                )
-                "#,
-            ))
-            .await?;
-
         info!("Listening on http://{}", leader.address());
 
         let mut watch_members = leader.watch_members().clone();
 
+        print_members(
+            leader.node().uuid,
+            &*watch_members.borrow_and_update(),
+            &Some(leader.node().clone()),
+        );
+
         loop {
             select! {
+                _ = watch_members.changed().fuse() => {
+                    print_members(leader.node().uuid, &*watch_members.borrow_and_update(), &Some(leader.node().clone()));
+                }
+
                 _ = wait_exit_signal().fuse() => {
                     info!("Shutting down...");
                     leader.shutdown().await?;
                     info!("Exited gracefully");
-                    break;
-                }
-
-                _ = watch_members.changed().fuse() => {
-                    print_members(&*watch_members.borrow_and_update());
+                    return Ok(());
                 }
 
                 _ = leader.lost_leadership().fuse() => {
                     warn!("Lost leadership!?");
-                    break;
+                    return Ok(());
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    async fn set_value(
-        State(state): State<LeaderState>,
-        Query(params): Query<HashMap<String, String>>,
-    ) -> Result<Json<serde_json::Value>, LolServerError> {
-        // retrieve the value parameter from the query string
-        let value = params
-            .get("value")
-            .ok_or_else(|| anyhow::anyhow!("please provide a value parameter!"))?;
-
-        // insert the value into the database
-        let ack = state
-            .execute(sqlx::query("INSERT INTO all_values (value) VALUES (?)").bind(value))
-            .await?;
-
-        info!(?value, "Value changed!");
-
-        // wait for the value to be safely replicated
-        ack.await?;
-
-        Ok(Json(json!({
-            "value": value,
-        })))
-    }
-
-    async fn get_value(
-        State(state): State<LeaderState>,
-    ) -> Result<Json<serde_json::Value>, LolServerError> {
-        // fetch the (last) value from the database
-        let value: Option<String> =
-            sqlx::query_scalar("SELECT value FROM all_values ORDER BY id DESC LIMIT 1")
-                .fetch_optional(state.db())
-                .await?;
-
-        Ok(Json(json!({
-            "value": value,
-        })))
-    }
-
-    struct LolServerError(anyhow::Error);
-
-    impl IntoResponse for LolServerError {
-        fn into_response(self) -> Response {
-            error!(err = ?self.0, "Internal server error");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": self.0.to_string() })),
-            )
-                .into_response()
-        }
-    }
-
-    impl<E> From<E> for LolServerError
-    where
-        E: Into<anyhow::Error>,
-    {
-        fn from(err: E) -> Self {
-            Self(err.into())
         }
     }
 }
@@ -353,22 +284,40 @@ async fn wait_exit_signal() -> Result<()> {
     Ok(())
 }
 
-fn print_members(members: &Members) {
+fn print_members(this: Uuid, members: &Members, leader: &Option<Node>) {
     let members = members.to_vec();
+    let members_len = members.len();
     let mut ascii_table = AsciiTable::default();
-    ascii_table.column(0).set_header("UUID");
-    ascii_table.column(1).set_header("Address");
-    ascii_table.column(2).set_header("AZ");
-    ascii_table.column(3).set_header("Roles");
+    ascii_table.set_max_width(200);
+    ascii_table.column(0).set_header("");
+    ascii_table.column(1).set_header("UUID");
+    ascii_table.column(2).set_header("Address");
+    ascii_table.column(3).set_header("AZ");
+    ascii_table.column(4).set_header("Roles");
     let mut data = Vec::with_capacity(members.len());
     for member in members {
-        data.push(vec![
-            member.node.uuid.to_string(),
-            member.node.address.to_string(),
-            member.node.az.to_string(),
-            member.roles.join(", "),
-        ]);
+        let mut row = vec![
+            (if member.node.uuid == this {
+                "*".to_string()
+            } else {
+                "".to_string()
+            })
+            .normal(),
+            member.node.uuid.to_string().normal(),
+            member.node.address.to_string().normal(),
+            member.node.az.to_string().normal(),
+            member.roles.join(", ").normal(),
+        ];
+        if member.node.uuid == leader.as_ref().map(|node| node.uuid).unwrap_or_default() {
+            for s in row.iter_mut() {
+                *s = s.clone().bold();
+            }
+        }
+        data.push(row);
     }
-    let members = ascii_table.format(data);
-    info!("Members changed\n{}", members);
+    let members_table = ascii_table.format(data);
+    info!(
+        "Cluster Memberhip ({}):{}\n\n{}",
+        "\x1B[0m", members_len, members_table
+    );
 }

@@ -137,10 +137,16 @@ impl Membership {
         Self::gc(state, &self.config);
     }
 
+    pub fn this(&self) -> Member {
+        self.state.lock().unwrap().this.clone()
+    }
+
     fn gc(mut state: MutexGuard<MembershipState>, config: &Config) {
         let now = Utc::now();
-        let this = state.this.clone();
-        state.alive.insert(this.node.uuid, (Utc::now(), this));
+        {
+            let this = state.this.clone();
+            state.alive.insert(this.node.uuid, (Utc::now(), this));
+        }
         state.alive.retain(|_, (seen, _old)| {
             (now - *seen).to_std().unwrap_or_default() < config.session_timeout
         });
@@ -176,8 +182,7 @@ impl MembersHash {
 
     pub fn from<'a>(members: impl Iterator<Item = &'a Member>) -> Self {
         let mut s = DefaultHasher::new();
-        let mut uuids = members.map(|member| member.node.uuid).collect::<Vec<_>>();
-        uuids.sort();
+        let uuids = members.map(|member| member.node.uuid).collect::<Vec<_>>();
         uuids.hash(&mut s);
         Self(s.finish())
     }

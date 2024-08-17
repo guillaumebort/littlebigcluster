@@ -12,15 +12,14 @@ use tokio::{
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error};
-use uuid::Uuid;
 
 use crate::{
-    client::LeaderClient,
     config::Config,
     db::DB,
-    members::{Member, Members, Membership},
+    gossip::{Member, Members, Membership},
+    http2_server::{JsonResponse, Server},
+    leader_client::LeaderClient,
     replica::Replica,
-    server::{JsonResponse, Server},
     Node,
 };
 
@@ -74,22 +73,22 @@ pub trait Follower {
 
     fn watch_members(&self) -> &watch::Receiver<Members>;
 
-    fn watch_epoch(&self) -> &watch::Receiver<u32>;
+    fn watch_epoch(&self) -> &watch::Receiver<u64>;
 
     fn db(&self) -> impl Executor<Database = Sqlite>;
 
     fn leader_client(&self) -> &LeaderClient;
 
-    fn uuid(&self) -> Uuid;
-
     fn address(&self) -> SocketAddr;
+
+    fn node(&self) -> &Node;
 
     fn object_store(&self) -> &Arc<dyn ObjectStore>;
 
     fn watch<A, F>(&self, f: F) -> impl Future<Output = Result<watch::Receiver<A>>>
     where
         A: Send + Sync + Eq + PartialEq + 'static,
-        F: (for<'a> Fn(u32, &'a SqlitePool, &'a Arc<dyn ObjectStore>) -> BoxFuture<'a, Result<A>>)
+        F: (for<'a> Fn(u64, &'a SqlitePool, &'a Arc<dyn ObjectStore>) -> BoxFuture<'a, Result<A>>)
             + Send
             + 'static;
 }
@@ -100,7 +99,7 @@ pub struct FollowerNode {
     db: DB,
     object_store: Arc<dyn ObjectStore>,
     watch_leader_node: watch::Receiver<Option<Node>>,
-    watch_epoch: watch::Receiver<u32>,
+    watch_epoch: watch::Receiver<u64>,
     leader_client: LeaderClient,
     membership: Membership,
     server: Server,
@@ -164,13 +163,8 @@ impl FollowerNode {
         ));
 
         // Start an http2 client always connected to the current leader
-        let leader_client = LeaderClient::new(
-            node.clone(),
-            roles,
-            watch_leader_node.clone(),
-            membership.clone(),
-            config,
-        );
+        let leader_client =
+            LeaderClient::new(membership.clone(), watch_leader_node.clone(), config).await;
 
         Ok(Self {
             node,
@@ -188,7 +182,7 @@ impl FollowerNode {
     async fn follow(
         replica: Arc<RwLock<Replica>>,
         leader_updates: watch::Sender<Option<Node>>,
-        epoch_updates: watch::Sender<u32>,
+        epoch_updates: watch::Sender<u64>,
         config: Config,
         cancel: CancellationToken,
     ) -> Result<()> {
@@ -249,7 +243,7 @@ impl Follower for FollowerNode {
         &self.watch_leader_node
     }
 
-    fn watch_epoch(&self) -> &watch::Receiver<u32> {
+    fn watch_epoch(&self) -> &watch::Receiver<u64> {
         &self.watch_epoch
     }
 
@@ -261,8 +255,8 @@ impl Follower for FollowerNode {
         &self.leader_client
     }
 
-    fn uuid(&self) -> Uuid {
-        self.node.uuid
+    fn node(&self) -> &Node {
+        &self.node
     }
 
     fn address(&self) -> SocketAddr {
@@ -276,7 +270,7 @@ impl Follower for FollowerNode {
     async fn watch<A, F>(&self, f: F) -> Result<watch::Receiver<A>>
     where
         A: Send + Sync + Eq + PartialEq + 'static,
-        F: (for<'a> Fn(u32, &'a SqlitePool, &'a Arc<dyn ObjectStore>) -> BoxFuture<'a, Result<A>>)
+        F: (for<'a> Fn(u64, &'a SqlitePool, &'a Arc<dyn ObjectStore>) -> BoxFuture<'a, Result<A>>)
             + Send
             + 'static,
     {
