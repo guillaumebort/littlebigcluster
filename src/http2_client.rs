@@ -22,13 +22,14 @@ use hyper::{
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use parking_lot::{lock_api::MappedRwLockReadGuard, Mutex, RawRwLock, RwLock, RwLockReadGuard};
 use serde::{de::DeserializeOwned, Serialize};
+use socket2::TcpKeepalive;
 use tokio::{
     net::TcpStream,
     select,
     sync::{watch, Notify},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use crate::Node;
 
@@ -49,7 +50,7 @@ impl Http2Client {
 
         let mut connections = vec![];
         for node in to.borrow_and_update().iter() {
-            let connection = match Http2Connection::open(node.clone()).await {
+            let connection = match Http2Connection::open(name.to_owned(), node.clone()).await {
                 Ok(connection) => connection,
                 Err(err) => {
                     debug!(?err, "failed to open http2 connection");
@@ -114,10 +115,10 @@ impl Http2Client {
             };
 
             for node in nodes_to_reconnect {
-                let connection = match Http2Connection::open(node).await {
+                let connection = match Http2Connection::open(client.to_owned(), node).await {
                     Ok(connection) => connection,
                     Err(err) => {
-                        debug!(?err, "failed to open http2 connection");
+                        debug!(?client, ?err, "failed to open http2 connection");
                         continue;
                     }
                 };
@@ -239,10 +240,21 @@ struct Http2Connection {
 }
 
 impl Http2Connection {
-    const KEEP_ALIVE: Duration = Duration::from_secs(1);
+    const KEEP_ALIVE: Duration = Duration::from_secs(5);
 
-    pub async fn open(node: Node) -> Result<Http2Connection> {
+    pub async fn open(client: String, node: Node) -> Result<Http2Connection> {
         let stream = TcpStream::connect(node.address).await?;
+
+        // properly configure the TCP connection
+        let stream = {
+            let stream = stream.into_std()?;
+            let socket = socket2::SockRef::from(&stream);
+            socket.set_nodelay(true)?;
+            socket.set_tcp_keepalive(&TcpKeepalive::new().with_time(Self::KEEP_ALIVE))?;
+            socket.set_tcp_user_timeout(Some(Self::KEEP_ALIVE))?;
+            tokio::net::TcpStream::from_std(stream)?
+        };
+
         let io = TokioIo::new(stream);
         let (mut sender, conn) = http2::Builder::new(TokioExecutor::new())
             .keep_alive_interval(Self::KEEP_ALIVE)
@@ -258,13 +270,13 @@ impl Http2Connection {
             tokio::spawn(async move {
                 select! {
                     _ = close.cancelled() => {
-                      debug!("http2 connection closed by client");
+                      trace!(?client, "http2 connection closed by client");
                     }
                     conn = conn => {
                         if let Err(err) = conn {
-                            error!(?err, "http2 connection error");
+                            error!(?client,?err, "http2 connection error");
                         } else {
-                            debug!("http2 connection closed by server");
+                            debug!(?client, "http2 connection closed by server");
                         }
                         close.cancel();
                     }

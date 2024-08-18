@@ -26,6 +26,8 @@ hyper-util = "0.1.8"
 pnet = "0.35"
 itertools = "0.13"
 parking_lot = "0.12"
+either = "1.13"
+socket2 = "0.5"
 
 [dev-dependencies]
 rand = "0.8.5"

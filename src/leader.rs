@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     net::SocketAddr,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, Weak},
 };
 
 use anyhow::{anyhow, Result};
@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 use hyper::StatusCode;
 use object_store::ObjectStore;
 use serde_json::{json, Value};
@@ -22,8 +22,8 @@ use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, Transaction};
 use tokio::{
     select,
     sync::{futures::Notified, watch, Notify, RwLock},
+    task::JoinSet,
 };
-use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
 
 use crate::{
@@ -136,13 +136,23 @@ impl LeaderState {
 pub trait Leader {
     fn shutdown(self) -> impl Future<Output = Result<()>>;
 
+    fn wait_for_leadership(&self) -> impl Future<Output = Result<()>>;
+
+    fn wait_for_lost_leadership(&self) -> impl Future<Output = Result<()>>;
+
+    fn db(&self) -> impl Executor<Database = Sqlite>;
+
+    fn object_store(&self) -> &Arc<dyn ObjectStore>;
+
+    fn watch_leader(&self) -> &watch::Receiver<Option<Node>>;
+
     fn watch_members(&self) -> &watch::Receiver<Members>;
 
-    fn lost_leadership(&self) -> impl Future<Output = ()>;
+    fn watch_epoch(&self) -> &watch::Receiver<u64>;
 
     fn address(&self) -> SocketAddr;
 
-    fn db(&self) -> impl Executor<Database = Sqlite>;
+    fn node(&self) -> &Node;
 
     fn transaction<A, E>(
         &self,
@@ -161,18 +171,6 @@ pub trait Leader {
         &self,
         query: sqlx::RawSql<'static>,
     ) -> impl Future<Output = Result<Ack<SqliteQueryResult>>>;
-
-    fn object_store(&self) -> &Arc<dyn ObjectStore>;
-
-    fn node(&self) -> &Node;
-}
-
-pub trait StandByLeader {
-    fn wait_for_leadership(self) -> impl Future<Output = Result<impl Leader>>;
-
-    fn db(&self) -> impl Executor<Database = Sqlite>;
-
-    fn object_store(&self) -> &Arc<dyn ObjectStore>;
 }
 
 #[derive(Clone, Debug)]
@@ -210,8 +208,10 @@ pub struct LeaderNode {
     leader_status: LeaderStatus,
     membership: Membership,
     graceful_shutdown: Arc<Notify>,
-    config: Config,
-    cancel: DropGuard,
+    watch_leader_node: watch::Receiver<Option<Node>>,
+    watch_epoch: watch::Receiver<u64>,
+    leader_client: Weak<LeaderClient>,
+    tasks: JoinSet<()>,
 }
 
 impl LeaderNode {
@@ -275,8 +275,46 @@ impl LeaderNode {
         };
         let server = Server::start(tcp_listener, leader_router.merge(additional_router)).await?;
 
-        // drop guard so we stop everything when the leader is dropped
-        let cancel = CancellationToken::new().drop_guard();
+        // Watch leader updates
+        let (leader_updates, watch_leader_node) =
+            watch::channel(replica.read().await.leader().await?);
+
+        // Create a watch for the epoch
+        let (epoch_updates, watch_epoch) = watch::channel(replica.read().await.epoch());
+
+        // HTTP client connected to the leader
+        let leader_client = Arc::new(
+            LeaderClient::new(
+                membership.clone(),
+                watch_leader_node.clone(),
+                config.clone(),
+            )
+            .await,
+        );
+
+        // Keep the replica up-to-date and try to acquire leadership
+        let mut tasks = JoinSet::new();
+        tasks.spawn(
+            Self::wait_for_leadership(
+                node.clone(),
+                leader_client.clone(),
+                leader_updates,
+                epoch_updates,
+                leader_status.clone(),
+                replica.clone(),
+                config.clone(),
+            )
+            .map({
+                let leader_status = leader_status.clone();
+                move |res| {
+                    leader_status.set_leader(false);
+                    if let Err(err) = res {
+                        error!(?err);
+                        panic!("Failed to acquire leadership: {err:#?}");
+                    }
+                }
+            }),
+        );
 
         Ok(Self {
             node,
@@ -287,62 +325,43 @@ impl LeaderNode {
             leader_status,
             membership,
             graceful_shutdown,
-            config,
-            cancel,
+            watch_leader_node,
+            watch_epoch,
+            leader_client: Arc::downgrade(&leader_client),
+            tasks,
         })
     }
 
-    async fn keep_alive(
-        is_leader: LeaderStatus,
+    async fn wait_for_leadership(
+        node: Node,
+        leader_client: Arc<LeaderClient>,
+        leader_updates: watch::Sender<Option<Node>>,
+        epoch_updates: watch::Sender<u64>,
+        leader_status: LeaderStatus,
         replica: Arc<RwLock<Replica>>,
         config: Config,
-        cancel: CancellationToken,
-    ) {
-        while !cancel.is_cancelled() {
-            select! {
-                _ = tokio::time::sleep(config.epoch_interval) => {
-                    match replica.write().await.incr_epoch().await {
-                        Ok(epoch) => {
-                            trace!(epoch, "Replica epoch incremented");
-                        }
-                        Err(err) => {
-                            error!(?err, "Cannot increment epoch, leader fenced? Giving up");
-                            break;
-                        }
-                    }
-                }
-                _ = cancel.cancelled() => break,
-            }
-        }
-        // ooops, we lost leadership
-        is_leader.set_leader(false);
-    }
-}
-
-impl StandByLeader for LeaderNode {
-    async fn wait_for_leadership(mut self) -> Result<impl Leader> {
+    ) -> Result<()> {
         debug!("Waiting for leadership...");
-
-        // HTTP client connected to the leader
-        let (leader_updates, watch_leader_node) =
-            watch::channel(self.replica.read().await.leader().await?);
-
-        #[allow(unused)]
-        let leader_client = LeaderClient::new(
-            self.membership.clone(),
-            watch_leader_node.clone(),
-            self.config.clone(),
-        )
-        .await;
-
         loop {
-            let mut replica = self.replica.write().await;
+            let mut replica_guard = replica.write().await;
+
             // Refresh the replica
-            replica.refresh().await?;
+            replica_guard.refresh().await?;
+
+            // Notify the epoch change
+            let current_epoch = replica_guard.epoch();
+            epoch_updates.send_if_modified(|state| {
+                if current_epoch != *state {
+                    *state = current_epoch;
+                    true
+                } else {
+                    false
+                }
+            });
 
             // Check current leader
-            let current_leader = replica.leader().await?;
-            let last_update = replica.last_update().await?;
+            let current_leader = replica_guard.leader().await?;
+            let last_update = replica_guard.last_update().await?;
             leader_updates.send_if_modified(|state| {
                 if current_leader != *state {
                     *state = current_leader.clone();
@@ -354,8 +373,7 @@ impl StandByLeader for LeaderNode {
 
             // If there is no leader OR the leader is stale
             if current_leader.is_none()
-                || (Utc::now() - last_update).to_std().unwrap_or_default()
-                    > self.config.session_timeout
+                || (Utc::now() - last_update).to_std().unwrap_or_default() > config.session_timeout
             {
                 debug!(
                     ?current_leader,
@@ -364,43 +382,62 @@ impl StandByLeader for LeaderNode {
                 );
 
                 // Try to acquire leadership (this is a race with other nodes)
-                match replica.try_change_leader(Some(self.node.clone())).await {
+                match replica_guard.try_change_leader(Some(node.clone())).await {
                     Ok(()) => {
                         // We are the leader!
                         debug!("Acquired leadership");
-                        self.leader_status.set_leader(true);
+                        leader_status.set_leader(true);
+
+                        drop(replica_guard);
+                        drop(leader_client);
 
                         // Spawn a keep-alive task incrementing the epoch and safely synchronizing the DB
                         // until the leader is dropped or explicitly shutdown
-                        let cancel = self.cancel.disarm();
-                        tokio::spawn(Self::keep_alive(
-                            self.leader_status.clone(),
-                            self.replica.clone(),
-                            self.config.clone(),
-                            cancel.child_token(),
-                        ));
-                        self.cancel = cancel.drop_guard();
-                        drop(replica);
-
-                        return Ok(self);
+                        return Self::keep_alive(epoch_updates, leader_status, replica, config)
+                            .await;
                     }
                     Err(err) => {
                         debug!(?err, "Failed to acquire leadership");
                     }
                 }
             }
-            drop(replica);
+            drop(replica_guard);
 
-            tokio::time::sleep(self.config.epoch_interval).await;
+            tokio::time::sleep(config.epoch_interval).await;
         }
     }
 
-    fn db(&self) -> impl Executor<Database = Sqlite> {
-        self.db.read_pool()
-    }
+    async fn keep_alive(
+        epoch_updates: watch::Sender<u64>,
+        is_leader: LeaderStatus,
+        replica: Arc<RwLock<Replica>>,
+        config: Config,
+    ) -> Result<()> {
+        loop {
+            tokio::time::sleep(config.epoch_interval).await;
+            match replica.write().await.incr_epoch().await {
+                Ok(epoch) => {
+                    trace!(epoch, "Replica epoch incremented");
 
-    fn object_store(&self) -> &Arc<dyn ObjectStore> {
-        &self.object_store
+                    // Notify the epoch change
+                    epoch_updates.send_if_modified(|state| {
+                        if epoch != *state {
+                            *state = epoch;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+                Err(err) => {
+                    error!(?err, "Cannot increment epoch, leader fenced? Giving up");
+                    break;
+                }
+            }
+        }
+        // ooops, we lost leadership
+        is_leader.set_leader(false);
+        Err(anyhow!("Lost leadership"))
     }
 }
 
@@ -412,25 +449,35 @@ impl Leader for LeaderNode {
         // Gracefully shutdown the server
         self.server.shutdown().await?;
 
-        // Stop keep-alive task
-        drop(self.cancel);
+        let leader_client = self.leader_client.upgrade();
 
-        // Release leadership
-        loop {
+        // Stop tasks
+        self.tasks.abort_all();
+        self.tasks.shutdown().await;
+
+        // If we have a leader client, at this point we are the only owner
+        // let's shutdown the client properly
+        if let Some(leader_client) = leader_client {
+            let client = Arc::try_unwrap(leader_client)
+                .map_err(|_| anyhow!("LeaderClient still in use???"))?;
+            client.shutdown().await?;
+        }
+
+        if self.leader_status.is_leader() {
+            self.leader_status.set_leader(false);
+
             // replica copies are owned by 1) the keep-alive task and 2) the server
             // so when both are shutdown, we should be the only one holding a replica copy
             match Arc::try_unwrap(self.replica) {
                 Ok(replica) => {
                     let mut replica = replica.into_inner();
-                    assert!(!self.leader_status.is_leader());
                     debug!("Releasing leadership...");
                     replica.try_change_leader(None).await?;
                     debug!("Released leadership");
-                    break;
                 }
                 Err(replica) => {
                     self.replica = replica;
-                    tokio::task::yield_now().await;
+                    error!("Failed to release leadership");
                 }
             }
         }
@@ -438,10 +485,18 @@ impl Leader for LeaderNode {
         Ok(())
     }
 
-    async fn lost_leadership(&self) {
+    async fn wait_for_leadership(&self) -> Result<()> {
+        while !self.leader_status.is_leader() {
+            self.leader_status.notify.notified().await;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_lost_leadership(&self) -> Result<()> {
         while self.leader_status.is_leader() {
             self.leader_status.notify.notified().await;
         }
+        Ok(())
     }
 
     fn address(&self) -> SocketAddr {
@@ -464,18 +519,30 @@ impl Leader for LeaderNode {
         A: Send + Unpin + 'static,
         E: Into<anyhow::Error> + Send,
     {
-        self.db.transaction(thunk).await
+        if self.leader_status.is_leader() {
+            self.db.transaction(thunk).await
+        } else {
+            Err(anyhow!("Not the leader"))
+        }
     }
 
     async fn execute<'a>(
         &'a self,
         query: sqlx::query::Query<'a, Sqlite, <Sqlite as sqlx::Database>::Arguments<'a>>,
     ) -> Result<Ack<SqliteQueryResult>> {
-        self.db.execute(query).await
+        if self.leader_status.is_leader() {
+            self.db.execute(query).await
+        } else {
+            Err(anyhow!("Not the leader"))
+        }
     }
 
     async fn execute_batch(&self, query: sqlx::RawSql<'static>) -> Result<Ack<SqliteQueryResult>> {
-        self.db.execute_batch(query).await
+        if self.leader_status.is_leader() {
+            self.db.execute_batch(query).await
+        } else {
+            Err(anyhow!("Not the leader"))
+        }
     }
 
     fn object_store(&self) -> &Arc<dyn ObjectStore> {
@@ -485,7 +552,17 @@ impl Leader for LeaderNode {
     fn watch_members(&self) -> &watch::Receiver<Members> {
         self.membership.watch()
     }
+
+    fn watch_leader(&self) -> &watch::Receiver<Option<Node>> {
+        &self.watch_leader_node
+    }
+
+    fn watch_epoch(&self) -> &watch::Receiver<u64> {
+        &self.watch_epoch
+    }
 }
+
+// ----- Server
 
 async fn leader_only(State(state): State<LeaderState>, request: Request, next: Next) -> Response {
     if state.is_leader() {

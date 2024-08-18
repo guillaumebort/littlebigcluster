@@ -17,7 +17,7 @@ pub use follower::Follower;
 use follower::{ClusterState, FollowerNode};
 pub use gossip::{Member, Members, Node};
 use leader::LeaderNode;
-pub use leader::{Leader, LeaderState, LeaderStatus, StandByLeader};
+pub use leader::{Leader, LeaderState, LeaderStatus};
 use object_store::ObjectStore;
 use replica::Replica;
 
@@ -52,7 +52,7 @@ impl LittleBigCluster {
         address: impl Into<SocketAddr>,
         router: Router<LeaderState>,
         additional_roles: Vec<(String, Router<ClusterState>)>,
-    ) -> Result<impl StandByLeader> {
+    ) -> Result<impl Leader> {
         let az = az.into();
         let address = address.into();
         let (roles, addtional_router) = Self::roles_with_router(additional_roles)?;

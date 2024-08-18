@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use hyper::Method;
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::watch,
+    task::{yield_now, JoinSet},
+};
 use tracing::{debug, error};
 
 use crate::{
@@ -16,7 +19,6 @@ pub struct LeaderClient {
     node: Node,
     http2_client: Http2Client,
     tasks: JoinSet<()>,
-    config: Config,
 }
 
 impl LeaderClient {
@@ -35,22 +37,17 @@ impl LeaderClient {
         tasks.spawn({
             async move {
                 loop {
-                    if let Err(err) = watch_leader.changed().await {
-                        error!(
-                            ?err,
-                            "Failed to receive leader nodes update in leader client"
-                        );
-                        break;
-                    }
+                    let _ = watch_leader.changed().await;
                     let leader_nodes = if let Some(ref node) = *watch_leader.borrow_and_update() {
                         vec![node.clone()]
                     } else {
                         vec![]
                     };
                     if let Err(err) = tx.send(leader_nodes) {
-                        error!(?err, "Failed to update leader nodes in http2 client");
+                        error!(?err, "Failed to send leader nodes to leader client");
                         break;
                     }
+                    yield_now().await
                 }
             }
         });
@@ -67,7 +64,6 @@ impl LeaderClient {
         LeaderClient {
             node,
             http2_client,
-            config,
             tasks,
         }
     }
@@ -124,9 +120,10 @@ impl LeaderClient {
         }
     }
 
-    pub async fn shutdown(self) -> Result<()> {
-        // stop gossip
-        drop(self.tasks);
+    pub async fn shutdown(mut self) -> Result<()> {
+        // stop tasks
+        self.tasks.abort_all();
+        self.tasks.shutdown().await;
 
         // if we are still connected to the leader, signal cleanly that we are going down
         if let Err(err) = self
