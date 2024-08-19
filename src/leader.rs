@@ -2,6 +2,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     sync::{atomic::AtomicBool, Arc, Weak},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -345,8 +346,8 @@ impl LeaderNode {
         loop {
             let mut replica_guard = replica.write().await;
 
-            // Refresh the replica
-            replica_guard.refresh().await?;
+            // Update the replica
+            replica_guard.follow().await?;
 
             // Notify the epoch change
             let current_epoch = replica_guard.epoch();
@@ -413,8 +414,11 @@ impl LeaderNode {
         replica: Arc<RwLock<Replica>>,
         config: Config,
     ) -> Result<()> {
+        let vacuum_every = Duration::from_secs(5 * 60).min(config.retention_period);
+        let mut vacuum_deadline = Instant::now();
         loop {
             tokio::time::sleep(config.epoch_interval).await;
+
             match replica.write().await.incr_epoch().await {
                 Ok(epoch) => {
                     trace!(epoch, "Replica epoch incremented");
@@ -434,7 +438,15 @@ impl LeaderNode {
                     break;
                 }
             }
+
+            if Instant::now() > vacuum_deadline {
+                vacuum_deadline = Instant::now() + vacuum_every;
+                if let Err(err) = replica.write().await.vacuum(config.retention_period).await {
+                    error!(?err, "Failed to schedule vacuum");
+                }
+            }
         }
+
         // ooops, we lost leadership
         is_leader.set_leader(false);
         Err(anyhow!("Lost leadership"))

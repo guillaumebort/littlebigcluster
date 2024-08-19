@@ -32,14 +32,14 @@ impl LittleBigCluster {
         cluster_id: impl Into<String>,
         object_store: impl ObjectStore,
         config: Config,
-    ) -> Result<Self> {
+    ) -> Self {
         let cluster_id = cluster_id.into();
         let object_store = Arc::new(object_store);
-        Ok(Self {
+        Self {
             cluster_id,
             object_store,
             config,
-        })
+        }
     }
 
     pub fn id(&self) -> &str {

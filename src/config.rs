@@ -4,8 +4,8 @@ use std::time::Duration;
 pub struct Config {
     pub epoch_interval: Duration,
     pub snapshot_interval: Duration,
-    pub snapshots_to_keep: usize,
     pub session_timeout: Duration,
+    pub retention_period: Duration,
 }
 
 impl Config {

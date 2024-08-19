@@ -14,10 +14,22 @@ use utils::{setup_tracing, wait_exit_signal};
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
+    path: std::path::PathBuf,
+
+    #[arg(short, long)]
+    #[clap(default_value = "0.0.0.0:0")]
+    address: SocketAddr,
+
+    #[arg(long)]
+    #[clap(default_value = "AZ0")]
+    az: String,
+
+    #[arg(short, long)]
+    #[clap(default_value = "lol")]
     cluster_id: String,
 
     #[arg(short, long)]
-    path: std::path::PathBuf,
+    roles: Vec<String>,
 
     #[arg(
         long,
@@ -26,17 +38,6 @@ struct Args {
         global = true,
     )]
     verbose: u8,
-
-    #[arg(short, long)]
-    #[clap(default_value = "0.0.0.0:0")]
-    address: SocketAddr,
-
-    #[arg(long)]
-    #[clap(default_value = "default")]
-    az: String,
-
-    #[arg(short, long)]
-    roles: Vec<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -58,13 +59,24 @@ pub async fn main() {
 
     setup_tracing(args.verbose);
 
-    let cluster = match open_cluster(&args.cluster_id, &args.path) {
-        Ok(cluster) => cluster,
+    let object_store = match LocalFileSystem::new_with_prefix(args.path) {
+        Ok(object_store) => object_store,
         Err(err) => {
-            error!(?err);
+            error!(?err, "Cannot connect to object store");
             std::process::exit(1);
         }
     };
+
+    let cluster = LittleBigCluster::at(
+        args.cluster_id,
+        object_store,
+        Config {
+            epoch_interval: Duration::from_secs(1),
+            snapshot_interval: Duration::from_secs(10),
+            session_timeout: Duration::from_secs(20),
+            retention_period: Duration::from_secs(30),
+        },
+    );
 
     let command_result = match args.command {
         Command::Init => init_cluster(&cluster).await,
@@ -76,19 +88,6 @@ pub async fn main() {
         error!(?err);
         std::process::exit(1);
     }
-}
-
-fn open_cluster(cluster_id: &str, path: &std::path::Path) -> Result<LittleBigCluster> {
-    LittleBigCluster::at(
-        cluster_id,
-        LocalFileSystem::new_with_prefix(path)?,
-        Config {
-            epoch_interval: Duration::from_secs(1),
-            snapshot_interval: Duration::from_secs(30),
-            snapshots_to_keep: 5,
-            session_timeout: Duration::from_secs(20),
-        },
-    )
 }
 
 async fn init_cluster(cluster: &LittleBigCluster) -> Result<()> {

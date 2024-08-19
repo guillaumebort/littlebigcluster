@@ -1,15 +1,21 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::{
-    stream::{FuturesOrdered, FuturesUnordered},
-    FutureExt, StreamExt, TryStreamExt,
+    stream::{self, FuturesOrdered},
+    FutureExt, StreamExt,
 };
 use object_store::{path::Path, ObjectStore, PutMode, PutOptions};
 use tempfile::NamedTempFile;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    task::JoinSet,
+};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
@@ -22,19 +28,23 @@ pub(crate) struct Replica {
     epoch: u64,
     db: DB,
     config: Config,
+    tasks: JoinSet<()>,
 }
 
 impl Replica {
-    pub const SNAPSHOT_PATH: &'static str = "/_lbc/snapshots";
-    pub const WAL_PATH: &'static str = "/_lbc/wal";
+    pub const PATH: &'static str = "/.lbc/";
+    pub const LAST_SNAPSHOT_PATH: &'static str = "/.lbc/.last_snapshot";
+    pub const LAST_VACUUM_PATH: &'static str = "/.lbc/.last_vacuum";
 
     pub async fn open(
         cluster_id: &str,
         object_store: Arc<dyn ObjectStore>,
         config: Config,
     ) -> Result<Self> {
-        // Find latest snapshot
-        let snapshot_epoch = Self::latest_snapshot_epoch(&object_store).await?;
+        // Find epochs
+        let (snapshot_epoch, current_epoch) = Self::latest_epochs(&object_store).await?;
+
+        // Retrieve the last snapshot
         debug!(snapshot_epoch, ?object_store, "Restoring snapshot");
         let snapshot = Self::get(&object_store, Self::snapshot_path(snapshot_epoch)).await?;
 
@@ -62,12 +72,13 @@ impl Replica {
             epoch: snapshot_epoch,
             db,
             config,
+            tasks: JoinSet::new(),
         };
 
         // Do a full refresh (find latest WALs and apply them)
         {
             let t = Instant::now();
-            replica.full_refresh().await?;
+            replica.full_refresh(current_epoch).await?;
             debug!(
                 replica.epoch,
                 snapshot_epoch,
@@ -87,7 +98,7 @@ impl Replica {
 
             // Verify that there is no file in the WAL path already
             if let Some(object) = object_store
-                .list(Some(&Path::from(Self::WAL_PATH)))
+                .list(Some(&Path::from(Self::PATH)))
                 .next()
                 .await
             {
@@ -135,6 +146,10 @@ impl Replica {
             Self::put_if_not_exists(&object_store, &Self::snapshot_path(0), snapshost_0.path())
                 .await?;
         }
+
+        // Markers
+        Self::override_marker(&object_store, Self::LAST_SNAPSHOT_PATH, 0).await?;
+        Self::override_marker(&object_store, Self::LAST_VACUUM_PATH, 0).await?;
 
         Ok(())
     }
@@ -257,7 +272,6 @@ impl Replica {
 
         // We are going to upload the snapshot in the background to avoid blocking the leader
         let object_store = self.object_store.clone();
-        let snapshots_to_keep = self.config.snapshots_to_keep;
         tokio::spawn(async move {
             if let Err(e) = Self::put_if_not_exists(
                 &object_store,
@@ -269,9 +283,70 @@ impl Replica {
                 error!(?e, "Failed to upload snapshot for epoch {}", snapshot_epoch);
             } else {
                 trace!(snapshot_epoch, "Snapshot uploaded");
-                // So it's maybe time to GC
-                if let Err(e) = Self::gc(&object_store, snapshots_to_keep).await {
-                    error!(?e, "Failed to GC after snapshot");
+                if let Err(e) =
+                    Self::override_marker(&object_store, Self::LAST_SNAPSHOT_PATH, snapshot_epoch)
+                        .await
+                {
+                    error!(?e, "Failed to update last snapshot marker");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    pub async fn vacuum(&mut self, retention_period: Duration) -> Result<()> {
+        let first_epoch_to_vacuum =
+            Self::read_marker(&self.object_store, Self::LAST_VACUUM_PATH).await?;
+        let last_epoch_to_vacuum = self
+            .epoch
+            .saturating_sub(retention_period.as_secs() / self.config.epoch_interval.as_secs());
+
+        debug!(first_epoch_to_vacuum, last_epoch_to_vacuum, "Vacuum");
+        let objects_to_delete = stream::unfold(first_epoch_to_vacuum, move |epoch| async move {
+            if epoch < last_epoch_to_vacuum {
+                if let Some(next_epoch) = epoch.checked_add(1) {
+                    Some((
+                        futures::stream::iter(vec![
+                            Ok(Self::snapshot_path(epoch)),
+                            Ok(Self::wal_path(epoch)),
+                        ]),
+                        next_epoch,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .boxed();
+
+        // vacuum run in the background
+        let object_store: Arc<dyn ObjectStore> = self.object_store.clone();
+        self.tasks.spawn(async move {
+            let mut results = object_store.delete_stream(objects_to_delete);
+            let mut failure = None;
+            while let Some(result) = results.next().await {
+                match result {
+                    Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(err) => {
+                        failure = Some(err);
+                    }
+                }
+            }
+            if let Some(err) = failure {
+                error!(?err, "Vacuum failed");
+            } else {
+                if let Err(e) = Self::override_marker(
+                    &object_store,
+                    Self::LAST_VACUUM_PATH,
+                    last_epoch_to_vacuum,
+                )
+                .await
+                {
+                    error!(?e, "Failed to update last vacuum marker");
                 }
             }
         });
@@ -340,9 +415,7 @@ impl Replica {
             .ok_or_else(|| anyhow!("epoch overflow"))
     }
 
-    /// Attempt to refresh the replica by applying the next WAL
-    /// Lookup for the next epoch WAL and apply it if it exists
-    pub async fn refresh(&mut self) -> Result<()> {
+    pub async fn follow(&mut self) -> Result<()> {
         while let Some(wal) =
             Self::get_if_exists(&self.object_store, Self::wal_path(self.next_epoch()?)).await?
         {
@@ -353,8 +426,7 @@ impl Replica {
         Ok(())
     }
 
-    pub async fn full_refresh(&mut self) -> Result<()> {
-        let current_epoch = Self::latest_wal_epoch(&self.object_store).await?;
+    pub async fn full_refresh(&mut self, current_epoch: u64) -> Result<()> {
         if current_epoch < self.epoch {
             bail!("TODO: current_epoch < self.epoch")
         } else {
@@ -370,82 +442,7 @@ impl Replica {
             }
         }
         self.epoch = current_epoch;
-        self.refresh().await
-    }
-
-    pub async fn gc(object_store: &impl ObjectStore, snapshots_to_keep: usize) -> Result<()> {
-        // keep N latest snapshots
-        let mut snapshots = object_store.list(Some(&Path::from(Self::SNAPSHOT_PATH)));
-        let mut snaphost_epochs = Vec::with_capacity(snapshots.size_hint().0);
-        while let Some(snapshot) = snapshots.next().await.transpose()? {
-            if let Some(epoch) = snapshot
-                .location
-                .filename()
-                .and_then(|filename| filename.strip_suffix(".db"))
-                .and_then(|filename| filename.parse::<u64>().ok())
-            {
-                snaphost_epochs.push(epoch);
-            }
-        }
-
-        if snaphost_epochs.is_empty() {
-            bail!("No snapshots found");
-        }
-
-        snaphost_epochs.sort_unstable();
-        snaphost_epochs.reverse();
-
-        let latest_snapshot_epoch = if snaphost_epochs.len() > snapshots_to_keep {
-            let (keep, delete) = snaphost_epochs.split_at(snapshots_to_keep);
-            debug!(
-                ?keep,
-                ?delete,
-                "GC Found {} snapshots",
-                snaphost_epochs.len()
-            );
-
-            let delete_futures = FuturesUnordered::new();
-            for epoch in delete {
-                let path = Self::snapshot_path(*epoch);
-                delete_futures.push(async move {
-                    trace!(?path, "Deleting old SNAPSHOT");
-                    object_store.delete(&path).await?;
-                    anyhow::Ok(())
-                });
-            }
-            if let Err(e) = delete_futures.try_collect::<Vec<_>>().await {
-                error!(?e, "Failed to delete all snapshots");
-            }
-            keep[0]
-        } else {
-            snaphost_epochs[0]
-        };
-
-        // now delete all WALs that are older than the latest snapshot
-        let delete_futures = FuturesUnordered::new();
-        let mut wals = object_store.list(Some(&Path::from(Self::WAL_PATH)));
-        while let Some(wal) = wals.next().await.transpose()? {
-            if let Some(epoch) = wal
-                .location
-                .filename()
-                .and_then(|filename| filename.strip_suffix(".wal"))
-                .and_then(|filename| filename.parse::<u64>().ok())
-            {
-                if epoch < latest_snapshot_epoch {
-                    let path = wal.location;
-                    trace!(?path, "Deleting old WAL");
-                    delete_futures.push(async move {
-                        object_store.delete(&path).await?;
-                        anyhow::Ok(())
-                    });
-                }
-            }
-        }
-        if let Err(e) = delete_futures.try_collect::<Vec<_>>().await {
-            error!(?e, "Failed to delete all WALs");
-        }
-
-        Ok(())
+        self.follow().await
     }
 
     async fn get(object_store: &impl ObjectStore, path: Path) -> Result<NamedTempFile> {
@@ -499,46 +496,83 @@ impl Replica {
         Ok(())
     }
 
+    async fn override_marker(
+        object_store: &impl ObjectStore,
+        path: &str,
+        epoch: u64,
+    ) -> Result<()> {
+        object_store
+            .put_opts(
+                &Path::from(path),
+                format!("{epoch:020}").into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn read_marker(object_store: &impl ObjectStore, path: &str) -> Result<u64> {
+        match object_store.get(&Path::from(path)).await {
+            Ok(get_result) => {
+                let bytes = get_result.bytes().await?;
+                let epoch = std::str::from_utf8(bytes.as_ref())?.trim().parse()?;
+                Ok(epoch)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn snapshot_path(epoch: u64) -> Path {
-        Path::from(Self::SNAPSHOT_PATH).child(format!("{:020}.db", epoch))
+        Path::from(Self::PATH).child(format!("{epoch:020}.db"))
     }
 
     fn wal_path(epoch: u64) -> Path {
-        Path::from(Self::WAL_PATH).child(format!("{:020}.wal", epoch))
+        Path::from(Self::PATH).child(format!("{epoch:020}.wal"))
     }
 
-    async fn latest_snapshot_epoch(object_store: &impl ObjectStore) -> Result<u64> {
-        Self::latest_epoch(object_store, &Path::from(Self::SNAPSHOT_PATH), ".db").await
+    fn parse_epoch(path: &Path) -> Result<u64> {
+        Ok(path
+            .filename()
+            .ok_or_else(|| anyhow!("Invalid path"))?
+            .strip_suffix(".db")
+            .or_else(|| path.filename().unwrap().strip_suffix(".wal"))
+            .ok_or_else(|| anyhow!("Invalid file extension"))?
+            .parse()
+            .context("Error parsing epoch from path")?)
     }
 
-    async fn latest_wal_epoch(object_store: &impl ObjectStore) -> Result<u64> {
-        Self::latest_epoch(object_store, &Path::from(Self::WAL_PATH), ".wal").await
-    }
+    async fn latest_epochs(object_store: &impl ObjectStore) -> Result<(u64, u64)> {
+        let mut last_snapshot_epoch = Self::read_marker(object_store, Self::LAST_SNAPSHOT_PATH)
+            .await
+            .context("Error retrieving start epoch from +last_snapshot")?;
 
-    async fn latest_epoch(
-        object_store: &impl ObjectStore,
-        path: &Path,
-        suffix: &str,
-    ) -> Result<u64> {
-        let mut items = object_store.list(Some(&path));
-        let mut current_epoch: Option<u64> = None;
-        while let Some(manifest) = match items.next().await.transpose() {
+        let mut objects = object_store.list_with_offset(
+            Some(&Path::from(Self::PATH)),
+            &Self::snapshot_path(last_snapshot_epoch),
+        );
+
+        let mut current_epoch = last_snapshot_epoch;
+
+        while let Some(object) = match objects.next().await.transpose() {
             Ok(file) => file,
             Err(e) => bail!("Failed to list objects: {}", e),
         } {
-            if let Some(epoch) = manifest
-                .location
-                .filename()
-                .and_then(|filename| filename.strip_suffix(suffix))
-                .and_then(|filename| filename.parse().ok())
-            {
-                if current_epoch.is_some_and(|current_epoch| current_epoch < epoch) {
-                    current_epoch = Some(epoch);
-                } else if current_epoch.is_none() {
-                    current_epoch = Some(epoch);
+            if let Some("db") = object.location.extension() {
+                let epoch = Self::parse_epoch(&object.location)?;
+                if epoch > last_snapshot_epoch {
+                    last_snapshot_epoch = epoch;
+                }
+            } else if let Some("wal") = object.location.extension() {
+                let epoch = Self::parse_epoch(&object.location)?;
+                if epoch > current_epoch {
+                    current_epoch = epoch;
                 }
             }
         }
-        current_epoch.ok_or_else(|| anyhow!("No objects found (was the cluster initialized?)"))
+
+        Ok((last_snapshot_epoch, current_epoch))
     }
 }

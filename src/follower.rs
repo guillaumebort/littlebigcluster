@@ -188,7 +188,7 @@ impl FollowerNode {
     ) -> Result<()> {
         while !cancel.is_cancelled() {
             let mut replica = replica.write().await;
-            replica.refresh().await?;
+            replica.follow().await?;
 
             // Notify the epoch change
             let current_epoch = replica.epoch();
@@ -212,6 +212,7 @@ impl FollowerNode {
                 }
             });
 
+            // Release the lock
             drop(replica);
 
             // Wait for the next epoch
