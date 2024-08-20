@@ -56,9 +56,10 @@ impl LittleBigCluster {
         let az = az.into();
         let address = address.into();
         let (roles, addtional_router) = Self::roles_with_router(additional_roles)?;
-        let node = Node::new(self.cluster_id, az, address);
+        let node = Node::new(az, address);
         LeaderNode::join(
             node,
+            &self.cluster_id,
             router,
             addtional_router,
             self.object_store,
@@ -77,8 +78,16 @@ impl LittleBigCluster {
         let az = az.into();
         let address = address.into();
         let (roles, router) = Self::roles_with_router(roles)?;
-        let node = Node::new(self.cluster_id, az, address);
-        FollowerNode::join(node, router, self.object_store, roles, self.config).await
+        let node = Node::new(az, address);
+        FollowerNode::join(
+            node,
+            &self.cluster_id,
+            router,
+            self.object_store,
+            roles,
+            self.config,
+        )
+        .await
     }
 
     fn roles_with_router(
@@ -94,7 +103,7 @@ impl LittleBigCluster {
     }
 
     pub async fn init(&self) -> Result<()> {
-        Replica::init(self.cluster_id.clone(), self.object_store.clone()).await?;
+        Replica::init(self.cluster_id.clone(), &self.object_store).await?;
         Ok(())
     }
 }

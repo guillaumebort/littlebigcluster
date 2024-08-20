@@ -218,6 +218,7 @@ pub struct LeaderNode {
 impl LeaderNode {
     pub async fn join(
         mut node: Node,
+        cluster_id: &str,
         router: Router<LeaderState>,
         additional_router: Router<ClusterState>,
         object_store: Arc<dyn ObjectStore>,
@@ -233,7 +234,7 @@ impl LeaderNode {
         let leader_status = LeaderStatus::new();
 
         // Open the replica
-        let replica = Replica::open(&node.cluster_id, object_store.clone(), config.clone()).await?;
+        let replica = Replica::open(cluster_id, &object_store, config.clone()).await?;
         let db: DB = replica.db().clone();
         let replica = Arc::new(RwLock::new(replica));
 
@@ -441,7 +442,7 @@ impl LeaderNode {
 
             if Instant::now() > vacuum_deadline {
                 vacuum_deadline = Instant::now() + vacuum_every;
-                if let Err(err) = replica.write().await.vacuum(config.retention_period).await {
+                if let Err(err) = replica.write().await.vacuum().await {
                     error!(?err, "Failed to schedule vacuum");
                 }
             }

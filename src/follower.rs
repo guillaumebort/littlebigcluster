@@ -110,6 +110,7 @@ pub struct FollowerNode {
 impl FollowerNode {
     pub async fn join(
         mut node: Node,
+        cluster_id: &str,
         router: Router<ClusterState>,
         object_store: Arc<dyn ObjectStore>,
         roles: Vec<String>,
@@ -121,7 +122,7 @@ impl FollowerNode {
         let tcp_listener = Server::bind(&mut node).await?;
 
         // Open the replica
-        let replica = Replica::open(&node.cluster_id, object_store.clone(), config.clone()).await?;
+        let replica = Replica::open(cluster_id, &object_store, config.clone()).await?;
 
         // Track membership
         let membership = Membership::new(

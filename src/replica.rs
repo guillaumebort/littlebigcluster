@@ -1,12 +1,10 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::{
+    channel::oneshot,
     stream::{self, FuturesOrdered},
     FutureExt, StreamExt,
 };
@@ -23,7 +21,8 @@ use crate::{config::Config, db::DB, Node};
 
 #[derive(Debug)]
 pub(crate) struct Replica {
-    pub object_store: Arc<dyn ObjectStore>,
+    cluster_id: String,
+    object_store: Arc<dyn ObjectStore>,
     snapshot_epoch: u64,
     epoch: u64,
     db: DB,
@@ -38,15 +37,15 @@ impl Replica {
 
     pub async fn open(
         cluster_id: &str,
-        object_store: Arc<dyn ObjectStore>,
+        object_store: &Arc<dyn ObjectStore>,
         config: Config,
     ) -> Result<Self> {
         // Find epochs
-        let (snapshot_epoch, current_epoch) = Self::latest_epochs(&object_store).await?;
+        let (snapshot_epoch, current_epoch) = Self::latest_epochs(object_store).await?;
 
         // Retrieve the last snapshot
         debug!(snapshot_epoch, ?object_store, "Restoring snapshot");
-        let snapshot = Self::get(&object_store, Self::snapshot_path(snapshot_epoch)).await?;
+        let snapshot = Self::get(object_store, Self::snapshot_path(snapshot_epoch)).await?;
 
         // Create a DB from the snapshot
         let db = DB::open(Some(snapshot.path())).await?;
@@ -67,7 +66,8 @@ impl Replica {
 
         // Replay WAL
         let mut replica = Replica {
-            object_store,
+            cluster_id: cluster_id.to_string(),
+            object_store: object_store.clone(),
             snapshot_epoch,
             epoch: snapshot_epoch,
             db,
@@ -90,7 +90,7 @@ impl Replica {
         Ok(replica)
     }
 
-    pub async fn init(cluster_id: String, object_store: Arc<dyn ObjectStore>) -> Result<()> {
+    pub async fn init(cluster_id: String, object_store: &Arc<dyn ObjectStore>) -> Result<()> {
         // Create a new (fresh) DB
         let db = DB::open(None).await?;
         {
@@ -143,13 +143,13 @@ impl Replica {
         {
             let snapshost_0 = NamedTempFile::new()?;
             db.snapshot(snapshost_0.path()).await?;
-            Self::put_if_not_exists(&object_store, &Self::snapshot_path(0), snapshost_0.path())
+            Self::put_if_not_exists(object_store, &Self::snapshot_path(0), snapshost_0.path())
                 .await?;
         }
 
         // Markers
-        Self::override_marker(&object_store, Self::LAST_SNAPSHOT_PATH, 0).await?;
-        Self::override_marker(&object_store, Self::LAST_VACUUM_PATH, 0).await?;
+        Self::override_marker(object_store, Self::LAST_SNAPSHOT_PATH, 0).await?;
+        Self::override_marker(object_store, Self::LAST_VACUUM_PATH, 0).await?;
 
         Ok(())
     }
@@ -178,27 +178,23 @@ impl Replica {
 
     /// Retrieve the leader for the replica current epoch
     pub async fn leader(&self) -> Result<Option<Node>> {
-        let maybe_node: Option<(String, String, String, String)> = sqlx::query_as(
+        let maybe_node: Option<(String, String, String)> = sqlx::query_as(
             r#"
-            SELECT * FROM
-                (SELECT
+            SELECT
                     json_extract(value, '$.uuid') AS uuid,
                     json_extract(value, '$.az') AS az,
                     json_extract(value, '$.address') AS address
                 FROM _lbc
-                WHERE key = 'leader')
-                JOIN
-                (SELECT value AS cluster_id FROM _lbc WHERE key = 'cluster_id')
+                WHERE key = 'leader'
             "#,
         )
         .fetch_optional(self.db.read_pool())
         .await?;
-        Ok(if let Some((uuid, az, address, cluster_id)) = maybe_node {
+        Ok(if let Some((uuid, az, address)) = maybe_node {
             Some(Node {
                 uuid: Uuid::parse_str(&uuid)?,
                 az,
                 address: address.parse()?,
-                cluster_id,
             })
         } else {
             None
@@ -213,7 +209,7 @@ impl Replica {
         let object_store = self.object_store.clone();
 
         // Snapshot if needed
-        if next_epoch - self.snapshot_epoch >= self.config.snapshot_interval_epochs().try_into()? {
+        if next_epoch - self.snapshot_epoch > self.config.snapshot_interval_epochs().try_into()? {
             self.snapshot().await?;
         }
 
@@ -295,12 +291,17 @@ impl Replica {
         Ok(())
     }
 
-    pub async fn vacuum(&mut self, retention_period: Duration) -> Result<()> {
+    pub async fn vacuum(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
         let first_epoch_to_vacuum =
             Self::read_marker(&self.object_store, Self::LAST_VACUUM_PATH).await?;
-        let last_epoch_to_vacuum = self
-            .epoch
-            .saturating_sub(retention_period.as_secs() / self.config.epoch_interval.as_secs());
+        let mut last_epoch_to_vacuum = self.epoch.saturating_sub(
+            self.config.retention_period.as_secs() / self.config.epoch_interval.as_secs(),
+        );
+
+        // in any case we don't vacuum past the last snapshot
+        if last_epoch_to_vacuum >= self.snapshot_epoch {
+            last_epoch_to_vacuum = self.snapshot_epoch;
+        }
 
         debug!(first_epoch_to_vacuum, last_epoch_to_vacuum, "Vacuum");
         let objects_to_delete = stream::unfold(first_epoch_to_vacuum, move |epoch| async move {
@@ -324,6 +325,7 @@ impl Replica {
         .boxed();
 
         // vacuum run in the background
+        let (tx, rx) = oneshot::channel();
         let object_store: Arc<dyn ObjectStore> = self.object_store.clone();
         self.tasks.spawn(async move {
             let mut results = object_store.delete_stream(objects_to_delete);
@@ -338,7 +340,9 @@ impl Replica {
             }
             if let Some(err) = failure {
                 error!(?err, "Vacuum failed");
+                let _ = tx.send(Err(err.into()));
             } else {
+                let _ = tx.send(Ok(()));
                 if let Err(e) = Self::override_marker(
                     &object_store,
                     Self::LAST_VACUUM_PATH,
@@ -351,7 +355,7 @@ impl Replica {
             }
         });
 
-        Ok(())
+        Ok(rx)
     }
 
     /// Attempt to change the leader for the next epoch
@@ -574,5 +578,332 @@ impl Replica {
         }
 
         Ok((last_snapshot_epoch, current_epoch))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    struct TmpObjectStore {
+        #[allow(unused)]
+        tmp: TempDir,
+        object_store: Arc<dyn ObjectStore>,
+    }
+
+    impl TmpObjectStore {
+        async fn new() -> Result<Self> {
+            let tmp = tempfile::tempdir()?;
+            let object_store = Arc::new(LocalFileSystem::new_with_prefix(tmp.path())?);
+            Ok(Self { tmp, object_store })
+        }
+    }
+
+    #[tokio::test]
+    async fn init_replica() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+
+        // init the replica
+        Replica::init("lol".to_string(), &tmp.object_store).await?;
+
+        // and now let's open it
+        let replica = Replica::open("lol", &tmp.object_store, Default::default()).await?;
+        assert_eq!(0, replica.epoch);
+        assert_eq!(0, replica.snapshot_epoch);
+
+        // DB works
+        let one: u32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(replica.db.read_pool())
+            .await?;
+        assert_eq!(1, one);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_initialized_replica() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+
+        // init the replica
+        Replica::init("lol".to_string(), &tmp.object_store).await?;
+
+        // and try to init it again
+        assert!(Replica::init("lol".to_string(), &tmp.object_store)
+            .await
+            .is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bad_cluster_id() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+
+        // init the replica
+        Replica::init("lol".to_string(), &tmp.object_store).await?;
+
+        // and now let's open it
+        assert!(Replica::open("bad", &tmp.object_store, Default::default())
+            .await
+            .is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn leader_follower() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+
+        // init the replica
+        Replica::init("lol".to_string(), &tmp.object_store).await?;
+
+        // let's open 2 replicas
+        let mut leader = Replica::open("lol", &tmp.object_store, Default::default()).await?;
+        let mut follower = Replica::open("lol", &tmp.object_store, Default::default()).await?;
+
+        assert_eq!(0, leader.epoch);
+        assert_eq!(0, leader.snapshot_epoch);
+        assert_eq!(0, follower.epoch);
+        assert_eq!(0, follower.snapshot_epoch);
+
+        // leader write to the DB
+        let ack = leader
+            .db
+            .transaction(|mut txn| {
+                async move {
+                    sqlx::query("CREATE TABLE lol (name TEXT)")
+                        .execute(&mut *txn)
+                        .await?;
+
+                    sqlx::query("INSERT INTO lol VALUES ('test')")
+                        .execute(&mut *txn)
+                        .await?;
+                    txn.commit().await
+                }
+                .boxed()
+            })
+            .await?;
+
+        // move the leader to epoch 1
+        leader.incr_epoch().await?;
+
+        // so now the write above is acknowledged
+        ack.await?;
+
+        assert_eq!(1, leader.epoch);
+        assert_eq!(0, leader.snapshot_epoch);
+
+        // but follower don't know about it
+
+        assert_eq!(0, follower.epoch);
+        assert_eq!(0, follower.snapshot_epoch);
+
+        assert!(sqlx::query("SELECT * FROM lol")
+            .fetch_one(follower.db.read_pool())
+            .await
+            .is_err());
+
+        // now the second replica should be able to follow
+        follower.follow().await?;
+
+        // follower is now at epoch 1
+        assert_eq!(1, follower.epoch);
+        assert_eq!(0, follower.snapshot_epoch);
+
+        // and it can see the data
+        let test: String = sqlx::query_scalar("SELECT name FROM lol")
+            .fetch_one(follower.db.read_pool())
+            .await?;
+        assert_eq!("test", test);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acquire_leadership() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+
+        // init the replica
+        Replica::init("lol".to_string(), &tmp.object_store).await?;
+
+        let leader_node = Node::new("A".to_string(), "0.0.0.0:0".parse()?);
+        let standby_leader_node = Node::new("A".to_string(), "0.0.0.0:0".parse()?);
+
+        // let's open 2 replicas
+        let mut leader = Replica::open("lol", &tmp.object_store, Default::default()).await?;
+        let mut standby_leader =
+            Replica::open("lol", &tmp.object_store, Default::default()).await?;
+
+        // leader acquire leadership
+        leader.try_change_leader(Some(leader_node.clone())).await?;
+
+        assert_eq!(1, leader.epoch);
+        assert_eq!(
+            Some(leader_node.uuid),
+            leader.leader().await?.map(|n| n.uuid)
+        );
+
+        // standby leader tries to acquire leadership
+        assert_eq!(0, standby_leader.epoch);
+        assert!(standby_leader
+            .try_change_leader(Some(standby_leader_node.clone()))
+            .await
+            .is_err());
+        assert_eq!(0, standby_leader.epoch);
+
+        // standby leader eventually sees the new leader
+        assert_eq!(None, standby_leader.leader().await?);
+        standby_leader.follow().await?;
+        assert_eq!(
+            Some(leader_node.uuid),
+            standby_leader.leader().await?.map(|n| n.uuid)
+        );
+        assert_eq!(1, standby_leader.epoch);
+
+        // standby leader steals leadership
+        standby_leader
+            .try_change_leader(Some(standby_leader_node.clone()))
+            .await?;
+        assert_eq!(2, standby_leader.epoch);
+
+        // so original leader has been fenced off
+        assert!(leader.incr_epoch().await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zombie_leader() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+
+        // init the replica
+        Replica::init("lol".to_string(), &tmp.object_store).await?;
+
+        // let's open 2 replicas
+        let mut leader = Replica::open("lol", &tmp.object_store, Default::default()).await?;
+        let mut zombie_leader = Replica::open("lol", &tmp.object_store, Default::default()).await?;
+
+        // move the leader to epoch 1
+        leader.incr_epoch().await?;
+
+        // zombie leader tries to do the same
+        assert!(zombie_leader.incr_epoch().await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_vacuum() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+
+        // init the replica
+        Replica::init("lol".to_string(), &tmp.object_store).await?;
+
+        // and now let's open it
+        let mut replica = Replica::open(
+            "lol",
+            &tmp.object_store,
+            Config {
+                epoch_interval: Duration::from_secs(1),
+                snapshot_interval: Duration::from_secs(10),
+                retention_period: Duration::from_secs(10),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // let's push the epoch to 29
+        for _ in 0..30 {
+            replica.incr_epoch().await?;
+        }
+
+        // last snapshot is at 20
+        assert_eq!(20, replica.snapshot_epoch);
+        assert_eq!(
+            b"00000000000000000020",
+            tmp.object_store
+                .get(&Path::from(Replica::LAST_SNAPSHOT_PATH))
+                .await?
+                .bytes()
+                .await?
+                .as_ref()
+        );
+
+        // but we have older snapshots in object store
+        tmp.object_store
+            .get(&Path::from(Replica::snapshot_path(10)))
+            .await?;
+        tmp.object_store
+            .get(&Path::from(Replica::snapshot_path(20)))
+            .await?;
+
+        // for example we could start over from 0 and applies subsequent WALs
+        for epoch in 0..=20 {
+            tmp.object_store
+                .get(&Path::from(Replica::wal_path(epoch)))
+                .await?;
+        }
+
+        // but now we vacuum
+        assert_eq!(
+            b"00000000000000000000",
+            tmp.object_store
+                .get(&Path::from(Replica::LAST_VACUUM_PATH))
+                .await?
+                .bytes()
+                .await?
+                .as_ref()
+        );
+
+        let vacuum = replica.vacuum().await?;
+
+        // vacuum are run in the background, let's wait for it
+        vacuum.await??;
+
+        // because we have a 10 seconds retention period we will only keep the last snapshot
+        assert!(tmp
+            .object_store
+            .get(&Path::from(Replica::snapshot_path(10)))
+            .await
+            .is_err());
+        tmp.object_store
+            .get(&Path::from(Replica::snapshot_path(20)))
+            .await?;
+
+        // old WALs are gone
+        for epoch in 0..=19 {
+            assert!(tmp
+                .object_store
+                .get(&Path::from(Replica::wal_path(epoch)))
+                .await
+                .is_err());
+        }
+
+        // recent WALs are still there
+        for epoch in 20..=29 {
+            assert!(tmp
+                .object_store
+                .get(&Path::from(Replica::wal_path(epoch)))
+                .await
+                .is_ok());
+        }
+
+        assert_eq!(
+            b"00000000000000000020",
+            tmp.object_store
+                .get(&Path::from(Replica::LAST_VACUUM_PATH))
+                .await?
+                .bytes()
+                .await?
+                .as_ref()
+        );
+
+        Ok(())
     }
 }

@@ -17,3 +17,14 @@ impl Config {
         self.epoch_interval * 2
     }
 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            epoch_interval: Duration::from_secs(1),
+            snapshot_interval: Duration::from_secs(30),
+            session_timeout: Duration::from_secs(20),
+            retention_period: Duration::from_secs(60 * 60 * 24 * 7),
+        }
+    }
+}

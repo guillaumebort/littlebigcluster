@@ -15,7 +15,6 @@ use crate::Config;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub uuid: Uuid,
-    pub cluster_id: String,
     pub az: String,
     pub address: SocketAddr,
 }
@@ -27,14 +26,9 @@ impl Hash for Node {
 }
 
 impl Node {
-    pub fn new(cluster_id: String, az: String, address: SocketAddr) -> Self {
+    pub fn new(az: String, address: SocketAddr) -> Self {
         let uuid = Uuid::now_v7();
-        Self {
-            uuid,
-            cluster_id,
-            az,
-            address,
-        }
+        Self { uuid, az, address }
     }
 }
 
