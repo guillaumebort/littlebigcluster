@@ -576,7 +576,7 @@ impl Leader for LeaderNode {
     }
 }
 
-// ----- Server
+// ---- HTTP API
 
 pub const STATUS_URL: &str = "/.lbc/status";
 pub const GOSSIP_URL: &str = "/.lbc/gossip";
@@ -590,6 +590,7 @@ async fn compose_routers(
         state.inner.node.clone(),
         state.inner.roles.clone(),
         state.inner.replica.clone(),
+        state.inner.membership.clone(),
     )
     .await;
     let leader_router = {

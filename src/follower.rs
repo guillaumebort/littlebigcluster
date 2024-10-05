@@ -17,6 +17,7 @@ use crate::{
     db::DB,
     gossip::{Member, Members, Membership},
     http2_server::{JsonResponse, Server},
+    leader::STATUS_URL,
     leader_client::LeaderClient,
     replica::Replica,
     Config, Node,
@@ -27,6 +28,7 @@ struct ClusterStateInner {
     node: Node,
     roles: Vec<String>,
     replica: Arc<RwLock<Replica>>,
+    membership: Membership,
     db: DB,
 }
 
@@ -36,13 +38,19 @@ pub struct ClusterState {
 }
 
 impl ClusterState {
-    pub(crate) async fn new(node: Node, roles: Vec<String>, replica: Arc<RwLock<Replica>>) -> Self {
+    pub(crate) async fn new(
+        node: Node,
+        roles: Vec<String>,
+        replica: Arc<RwLock<Replica>>,
+        membership: Membership,
+    ) -> Self {
         let db = replica.read().await.db().clone();
         Self {
             inner: Arc::new(ClusterStateInner {
                 node,
                 roles,
                 replica,
+                membership,
                 db,
             }),
         }
@@ -76,6 +84,8 @@ pub trait Follower {
 
     fn read(&self) -> impl Executor<Database = Sqlite>;
 
+    fn leader(&self) -> watch::Ref<'_, Option<Node>>;
+
     fn leader_client(&self) -> &LeaderClient;
 
     fn address(&self) -> SocketAddr;
@@ -83,6 +93,8 @@ pub trait Follower {
     fn node(&self) -> &Node;
 
     fn object_store(&self) -> &Arc<dyn ObjectStore>;
+
+    fn wait_for_leader(&self) -> impl Future<Output = Result<Node>>;
 
     fn watch<A, F>(&self, f: F) -> impl Future<Output = Result<watch::Receiver<A>>>
     where
@@ -144,12 +156,16 @@ impl FollowerNode {
         let replica = Arc::new(RwLock::new(replica));
 
         // Start the server
-        let state = ClusterState::new(node.clone(), roles.clone(), replica.clone()).await;
-        let system_router = Router::new().route("/status", get(status));
-        let router = Router::new()
-            .nest("/.lbc", system_router)
-            .merge(router)
-            .with_state(state);
+        let router = compose_router(
+            ClusterState::new(
+                node.clone(),
+                roles.clone(),
+                replica.clone(),
+                membership.clone(),
+            )
+            .await,
+            router,
+        );
         let server = Server::start(tcp_listener, router).await?;
 
         // Keep the replica up-to-date until the follower is dropped
@@ -240,8 +256,18 @@ impl Follower for FollowerNode {
         self.membership.watch()
     }
 
+    fn leader(&self) -> watch::Ref<'_, Option<Node>> {
+        self.watch_leader_node.borrow()
+    }
+
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>> {
         &self.watch_leader_node
+    }
+
+    async fn wait_for_leader(&self) -> Result<Node> {
+        let mut watch_leader = self.watch_leader().clone();
+        let leader = watch_leader.wait_for(|leader| leader.is_some()).await?;
+        leader.clone().ok_or_else(|| anyhow::anyhow!("No leader"))
     }
 
     fn watch_epoch(&self) -> &watch::Receiver<u64> {
@@ -311,6 +337,16 @@ impl Follower for FollowerNode {
     }
 }
 
+// --- HTTP API
+
+fn compose_router(state: ClusterState, router: Router<ClusterState>) -> Router {
+    let system_router = Router::new().route(STATUS_URL, get(status));
+    Router::new()
+        .merge(system_router)
+        .merge(router)
+        .with_state(state)
+}
+
 #[debug_handler]
 async fn status(State(state): State<ClusterState>) -> JsonResponse<Value> {
     let replica = state.replica();
@@ -329,5 +365,264 @@ async fn status(State(state): State<ClusterState>) -> JsonResponse<Value> {
             "path": replica.db().path().display().to_string(),
             "size": tokio::fs::metadata(replica.db().path()).await?.len(),
         },
+        "members": state.inner.membership.watch().borrow().to_vec(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures::{stream::FuturesUnordered, TryStreamExt};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+    use test_log::test;
+    use tokio::task::JoinSet;
+
+    use super::*;
+    use crate::{leader::LeaderNode, Leader};
+
+    struct TmpObjectStore {
+        #[allow(unused)]
+        tmp: TempDir,
+        object_store: Arc<dyn ObjectStore>,
+    }
+
+    impl TmpObjectStore {
+        async fn new() -> Result<Self> {
+            let tmp = tempfile::tempdir()?;
+            let object_store = Arc::new(LocalFileSystem::new_with_prefix(tmp.path())?);
+            let tmp = Self { tmp, object_store };
+            // init replica
+            Replica::init("test", &tmp.object_store).await?;
+            Ok(tmp)
+        }
+    }
+
+    #[test(tokio::test)]
+    async fn start_follower() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+        let config = Config {
+            epoch_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        // start a follower node
+        let follower = FollowerNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            tmp.object_store,
+            vec![],
+            config,
+        )
+        .await?;
+
+        let mut epoch = follower.watch_epoch().clone();
+
+        // the epoch won't move because there is no leader
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), epoch.changed())
+                .await
+                .is_err()
+        );
+
+        // there is no leader
+        assert_eq!(None, *follower.leader());
+
+        // it is the single member
+        assert_eq!(1, follower.watch_members().borrow().len());
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn follower_join_leader() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+        let config = Config {
+            epoch_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        // start a follower node
+        let follower = FollowerNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            tmp.object_store.clone(),
+            vec![],
+            config.clone(),
+        )
+        .await?;
+
+        let mut watch_epoch = follower.watch_epoch().clone();
+        let mut watch_leader = follower.watch_leader().clone();
+        let mut watch_members = follower.watch_members().clone();
+
+        // start a leader node
+        let leader = LeaderNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            Router::new(),
+            tmp.object_store,
+            vec![],
+            config,
+        )
+        .await?;
+        leader.wait_for_leadership().await?;
+        let mut members_as_seen_by_leader = leader.watch_members().clone();
+
+        // the leader will make the epoch move
+        watch_epoch.changed().await?;
+
+        // the leader is the leader
+        watch_leader.changed().await?;
+        assert_eq!(Some(leader.node()), follower.leader().as_ref());
+
+        // there are two members
+        watch_members.changed().await?;
+        assert_eq!(2, watch_members.borrow_and_update().len());
+        assert_eq!(2, members_as_seen_by_leader.borrow_and_update().len());
+
+        // follower is shutdown
+        follower.shutdown().await?;
+
+        // leader has seen the follower leave
+        members_as_seen_by_leader.changed().await?;
+        assert_eq!(1, members_as_seen_by_leader.borrow_and_update().len());
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn lost_leader() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+        let config = Config {
+            epoch_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        // start a leader node
+        let leader = LeaderNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            Router::new(),
+            tmp.object_store.clone(),
+            vec![],
+            config.clone(),
+        )
+        .await?;
+
+        // start a follower node
+        let follower = FollowerNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            tmp.object_store.clone(),
+            vec![],
+            config.clone(),
+        )
+        .await?;
+
+        // wait for the follower to see the leader
+        let mut watch_leader = follower.watch_leader().clone();
+        watch_leader.wait_for(|leader| leader.is_some()).await?;
+
+        // shutdown the leader
+        leader.shutdown().await?;
+
+        // wait for the follower to see the leader leave
+        watch_leader.wait_for(|leader| leader.is_none()).await?;
+
+        Ok(())
+    }
+
+    #[ignore = "test uses a lot of resources"]
+    #[test(tokio::test)]
+    async fn tons_of_followers() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+        let config = Config {
+            epoch_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        // start a leader node
+        let leader = LeaderNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            Router::new(),
+            tmp.object_store.clone(),
+            vec![],
+            config.clone(),
+        )
+        .await?;
+
+        // start 100 followers
+        let followers = FuturesUnordered::new();
+        for _ in 0..100 {
+            followers.push(async {
+                let follower = FollowerNode::join(
+                    Node::new("xx", "127.0.0.1:0".parse()?),
+                    "test",
+                    Router::new(),
+                    tmp.object_store.clone(),
+                    vec![],
+                    config.clone(),
+                )
+                .await?;
+                follower.wait_for_leader().await?;
+                anyhow::Ok(follower)
+            });
+        }
+
+        // wait for all followers to be ready
+        let followers = followers.try_collect::<Vec<_>>().await?;
+        assert_eq!(100, followers.len());
+
+        // wait for the membership to stabilize
+        let mut members_seen_by_leader = leader.watch_members().clone();
+        members_seen_by_leader
+            .wait_for(|members| members.len() == 101)
+            .await?;
+
+        // let's shutdown half of the followers
+        let mut shutting_down = JoinSet::new();
+        let mut remaining_followers = Vec::new();
+        for (i, follower) in followers.into_iter().enumerate() {
+            if i % 2 == 0 {
+                shutting_down.spawn(follower.shutdown());
+            } else {
+                remaining_followers.push(follower);
+            }
+        }
+        shutting_down.join_all().await;
+
+        // wait for the membership to stabilize
+        let mut members_seen_by_leader = leader.watch_members().clone();
+        members_seen_by_leader
+            .wait_for(|members| members.len() == 51)
+            .await?;
+
+        // check what remaining followers see
+        for follower in remaining_followers.iter() {
+            let mut watch_members = follower.watch_members().clone();
+            watch_members
+                .wait_for(|members| members.len() == 51)
+                .await?;
+        }
+
+        // now shutdown the leader
+        leader.shutdown().await?;
+
+        // check what remaining followers see
+        for follower in remaining_followers.iter() {
+            let mut watch_leader: watch::Receiver<Option<Node>> = follower.watch_leader().clone();
+            watch_leader.wait_for(|leader| leader.is_none()).await?;
+        }
+
+        Ok(())
+    }
 }

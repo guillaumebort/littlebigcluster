@@ -209,30 +209,30 @@ mod tests {
         // open a leader client (but we have no leader yet)
         let (tx, rx) = watch::channel(None);
         let client = LeaderClient::new(client_membership.clone(), rx).await?;
-        let mut client_members = client_membership.watch().clone();
+        let mut members_seen_by_client = client_membership.watch().clone();
 
-        assert_eq!(1, client_members.borrow_and_update().to_vec().len());
+        assert_eq!(1, members_seen_by_client.borrow_and_update().to_vec().len());
 
         // start a fake leader
         let fake_leader = start_fake_leader().await?;
-        let mut leader_members = fake_leader.membership.watch().clone();
+        let mut members_seen_by_leader = fake_leader.membership.watch().clone();
 
         // the leader client should connect to the leader
         tx.send(Some(fake_leader.node.clone()))?;
 
         // so it will eventually tell the leader that it is alive, and the membership will be updated
-        client_members.changed().await?;
-        assert_eq!(2, client_members.borrow_and_update().to_vec().len());
+        members_seen_by_client.changed().await?;
+        assert_eq!(2, members_seen_by_client.borrow_and_update().to_vec().len());
 
         // the server sees 2 members as well
-        assert_eq!(2, leader_members.borrow_and_update().to_vec().len());
+        assert_eq!(2, members_seen_by_leader.borrow_and_update().to_vec().len());
 
         // now shutdown the leader client
         client.shutdown().await?;
 
         // the leader should see that the client is dead
-        leader_members.changed().await?;
-        assert_eq!(1, leader_members.borrow_and_update().to_vec().len());
+        members_seen_by_leader.changed().await?;
+        assert_eq!(1, members_seen_by_leader.borrow_and_update().to_vec().len());
 
         Ok(())
     }
