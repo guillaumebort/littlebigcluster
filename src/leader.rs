@@ -19,7 +19,7 @@ use futures::{future::BoxFuture, FutureExt};
 use hyper::StatusCode;
 use object_store::ObjectStore;
 use serde_json::{json, Value};
-use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, Transaction};
+use sqlx::{sqlite::SqliteQueryResult, Executor, Sqlite, SqliteConnection};
 use tokio::{
     select,
     sync::{futures::Notified, watch, Notify, RwLock},
@@ -97,20 +97,19 @@ impl LeaderState {
     }
 
     pub fn db(&self) -> impl Executor<Database = Sqlite> {
-        self.inner.db.read_pool()
+        self.inner.db.read()
     }
 
     pub fn roles(&self) -> &[String] {
         &self.inner.roles
     }
 
-    pub async fn transaction<A, E>(
+    pub async fn transaction<A>(
         &self,
-        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
+        thunk: impl (for<'c> FnOnce(&'c mut SqliteConnection) -> BoxFuture<'c, Result<A>>) + Send,
     ) -> Result<Ack<A>>
     where
         A: Send + Unpin + 'static,
-        E: Into<anyhow::Error> + Send,
     {
         self.inner.db.transaction(thunk).await
     }
@@ -155,13 +154,12 @@ pub trait Leader {
 
     fn node(&self) -> &Node;
 
-    fn transaction<A, E>(
+    fn transaction<A>(
         &self,
-        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
+        thunk: impl (for<'c> FnOnce(&'c mut SqliteConnection) -> BoxFuture<'c, Result<A>>) + Send,
     ) -> impl Future<Output = Result<Ack<A>>>
     where
-        A: Send + Unpin + 'static,
-        E: Into<anyhow::Error> + Send;
+        A: Send + Unpin + 'static;
 
     fn execute<'a>(
         &'a self,
@@ -526,20 +524,19 @@ impl Leader for LeaderNode {
     }
 
     fn db(&self) -> impl Executor<Database = Sqlite> {
-        self.db.read_pool()
+        self.db.read()
     }
 
     fn node(&self) -> &Node {
         &self.node
     }
 
-    async fn transaction<A, E>(
+    async fn transaction<A>(
         &self,
-        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
+        thunk: impl (for<'c> FnOnce(&'c mut SqliteConnection) -> BoxFuture<'c, Result<A>>) + Send,
     ) -> Result<Ack<A>>
     where
         A: Send + Unpin + 'static,
-        E: Into<anyhow::Error> + Send,
     {
         if self.leader_status.is_leader() {
             self.db.transaction(thunk).await

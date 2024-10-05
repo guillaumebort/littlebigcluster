@@ -49,7 +49,7 @@ impl ClusterState {
     }
 
     pub fn db(&self) -> impl Executor<Database = Sqlite> {
-        self.inner.db.read_pool()
+        self.inner.db.read()
     }
 
     pub fn this(&self) -> &Node {
@@ -249,7 +249,7 @@ impl Follower for FollowerNode {
     }
 
     fn db(&self) -> impl Executor<Database = Sqlite> {
-        self.db.read_pool()
+        self.db.read()
     }
 
     fn leader_client(&self) -> &LeaderClient {
@@ -278,14 +278,14 @@ impl Follower for FollowerNode {
         let db = self.db.clone();
         let object_store = self.object_store.clone();
         let mut watch_epoch = self.watch_epoch().clone();
-        let current = f(*watch_epoch.borrow(), db.read_pool(), &object_store).await?;
+        let current = f(*watch_epoch.borrow(), db.read(), &object_store).await?;
         let (tx, rx) = watch::channel(current);
         tokio::spawn(async move {
             while !tx.is_closed() {
                 select! {
                   _ = watch_epoch.changed() => {
                     let epoch = *watch_epoch.borrow();
-                    match f(epoch, db.read_pool(), &object_store).await {
+                    match f(epoch, db.read(), &object_store).await {
                       Ok(current) => {
                         tx.send_if_modified(|state| {
                           if current != *state {

@@ -15,7 +15,7 @@ use futures::{future::BoxFuture, FutureExt};
 use sqlx::{
     pool::PoolConnection,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteQueryResult},
-    ConnectOptions, Connection, Sqlite, SqliteConnection, SqlitePool, Transaction,
+    ConnectOptions, Executor, Sqlite, SqliteConnection, SqlitePool,
 };
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{runtime::Handle, sync::oneshot};
@@ -59,7 +59,7 @@ where
 }
 
 #[derive(Clone)]
-pub(crate) struct DB {
+pub struct DB {
     db_path: PathBuf,
     read_pool: SqlitePool,
     write_conn: Arc<tokio::sync::Mutex<(SqliteConnection, Vec<DoAck>)>>,
@@ -98,7 +98,8 @@ impl DB {
         }
 
         // we use a single write connection to mitigate lock contention
-        let write_conn = Self::connect_options(&db_path)?.connect().await?;
+        let mut write_conn = Self::connect_options(&db_path)?.connect().await?;
+        write_conn.execute("BEGIN;").await?;
 
         // the read pool has a connection per core but is read only
         let cpus = num_cpus::get().try_into()?;
@@ -124,8 +125,14 @@ impl DB {
         })
     }
 
-    pub fn read_pool(&self) -> &SqlitePool {
+    #[allow(unused)]
+    pub fn read(&self) -> &SqlitePool {
         &self.read_pool
+    }
+
+    #[allow(unused)]
+    pub async fn read_uncommitted(&self) -> tokio::sync::MappedMutexGuard<'_, SqliteConnection> {
+        tokio::sync::MutexGuard::map(self.write_conn.lock().await, |(conn, _)| conn)
     }
 
     pub fn path(&self) -> &Path {
@@ -148,7 +155,7 @@ impl DB {
         PathBuf::from(format!("{}-shm", self.db_path.display()))
     }
 
-    pub(crate) async fn checkpoint<A>(
+    pub async fn checkpoint<A>(
         &self,
         f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
     ) -> Result<A>
@@ -190,7 +197,7 @@ impl DB {
         }
     }
 
-    pub(crate) async fn try_checkpoint<A>(
+    pub async fn try_checkpoint<A>(
         &self,
         f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
     ) -> Result<A>
@@ -235,17 +242,38 @@ impl DB {
         let mut prev_pending_acks = Vec::with_capacity(1_024);
         std::mem::swap(&mut prev_pending_acks, pending_acks);
 
+        // flush pending writes to the wal
+        connection.execute("COMMIT;").await?;
+
         // run user code
         let wal_path = self.wal_path();
         let result =
             tokio::task::spawn_blocking(move || Handle::current().block_on(f(wal_path))).await?;
 
-        // run the checkpoint
         if result.is_ok() {
-            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-                .execute(&mut *connection)
+            // apply the wal to the db
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                .await?;
+        } else {
+            // discard the wal
+            let _guard = self.block_all_reads().await?;
+            let wal_path = self.wal_path();
+            let shm_path = self.shm_path();
+            tokio::task::spawn_blocking(move || {
+                std::fs::File::create(wal_path)?; // truncate wal file
+                Self::invalidate_shm(&shm_path)
+            })
+            .await??;
+
+            // truncate properly
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 .await?;
         }
+
+        // start a new transaction
+        connection.execute("BEGIN;").await?;
 
         Ok((result, prev_pending_acks))
     }
@@ -265,23 +293,18 @@ impl DB {
             // this will block all concurrent writes
             let (ref mut connection, ref mut pending_acks) = *self.write_conn.lock().await;
 
-            // this will block all concurrent reads
-            let _read_guard = self.block_all_reads().await?;
-
             std::mem::swap(&mut prev_pending_acks, pending_acks);
 
-            let wal_path = self.wal_path();
-            let shm_path = self.shm_path();
-            tokio::task::spawn_blocking(move || {
-                std::fs::File::create(wal_path)?; // truncate wal file
-                Self::invalidate_shm(&shm_path)
-            })
-            .await??;
+            // rollback the current transaction
+            connection.execute("ROLLBACK;").await?;
 
-            // truncate properly
-            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-                .execute(&mut *connection)
+            // truncate wal file (but should be empty)
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 .await?;
+
+            // start a new transaction
+            connection.execute("BEGIN;").await?;
         }
         // Reject all pending acks
         tokio::task::spawn_blocking(move || {
@@ -293,14 +316,16 @@ impl DB {
         Ok(())
     }
 
-    pub(crate) async fn snapshot(&self, db_snapshot: impl Into<PathBuf>) -> Result<()> {
+    pub async fn snapshot(&self, db_snapshot: impl Into<PathBuf>) -> Result<()> {
         // this will block all concurrent writes
         let (ref mut connection, _) = *self.write_conn.lock().await;
 
         // truncate wal file
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *connection)
+        connection.execute("COMMIT;").await?;
+        connection
+            .execute("PRAGMA wal_checkpoint(TRUNCATE);")
             .await?;
+        connection.execute("BEGIN;").await?;
 
         // copy the db file
         let db_path = self.db_path.clone();
@@ -310,7 +335,7 @@ impl DB {
         Ok(())
     }
 
-    pub(crate) async fn apply_wal(&self, wal_snapshot: impl Into<PathBuf>) -> Result<()> {
+    pub async fn apply_wal(&self, wal_snapshot: impl Into<PathBuf>) -> Result<()> {
         // this will block all concurrent writes
         let (ref mut connection, _) = *self.write_conn.lock().await;
 
@@ -318,8 +343,9 @@ impl DB {
         let _read_guard = self.block_all_reads().await?;
 
         // truncate wal file
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *connection)
+        connection.execute("COMMIT;").await?;
+        connection
+            .execute("PRAGMA wal_checkpoint(TRUNCATE);")
             .await?;
 
         let wal_snapshot = wal_snapshot.into();
@@ -338,6 +364,9 @@ impl DB {
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&mut *connection)
             .await?;
+
+        connection.execute("BEGIN;").await?;
+
         Ok(())
     }
 
@@ -360,19 +389,24 @@ impl DB {
         Ok(())
     }
 
-    pub async fn transaction<A, E>(
+    pub async fn transaction<A>(
         &self,
-        thunk: impl (for<'c> FnOnce(Transaction<'c, Sqlite>) -> BoxFuture<'c, Result<A, E>>) + Send,
+        thunk: impl (for<'c> FnOnce(&'c mut SqliteConnection) -> BoxFuture<'c, Result<A>>) + Send,
     ) -> Result<Ack<A>>
     where
         A: Send + Unpin + 'static,
-        E: Into<anyhow::Error> + Send,
     {
         let (ref mut conn, ref mut pending_acks) = *self.write_conn.lock().await;
-        let txn = conn.begin().await?;
-        let result = match thunk(txn).await {
-            Ok(result) => Some(result),
-            Err(e) => bail!(e.into()),
+        conn.execute("SAVEPOINT _lbc_tx;").await?;
+        let result = match thunk(conn).await {
+            Ok(result) => {
+                conn.execute("RELEASE SAVEPOINT _lbc_tx").await?;
+                Some(result)
+            }
+            Err(e) => {
+                conn.execute("ROLLBACK TO SAVEPOINT _lbc_tx").await?;
+                bail!(e)
+            }
         };
         let (do_ack, ack) = tokio::sync::oneshot::channel();
         pending_acks.push(do_ack);
@@ -412,10 +446,11 @@ mod tests {
     use futures::FutureExt;
     use rand::Rng;
     use tempfile::NamedTempFile;
+    use test_log::test;
 
     use super::*;
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn open_and_query() -> Result<()> {
         let db = DB::open(None).await?;
         let one: i64 = sqlx::query_scalar("select 1")
@@ -425,7 +460,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn open_and_insert() -> Result<()> {
         let db = DB::open(None).await?;
         let _ = &db
@@ -438,7 +473,7 @@ mod tests {
             .await?;
 
         let uuid: String = sqlx::query_scalar("select * from batchs")
-            .fetch_one(&db.read_pool)
+            .fetch_one(&mut *db.read_uncommitted().await)
             .await?;
 
         assert_eq!("0191b6d0-3d9a-7eb1-88b8-5312737f2ca0", uuid);
@@ -446,7 +481,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn write_in_readonly_pool() -> Result<()> {
         let db = DB::open(None).await?;
         assert!(sqlx::query("create table lol(id);")
@@ -457,7 +492,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn block_pool() -> Result<()> {
         let db = DB::open(None).await?;
 
@@ -476,26 +511,28 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn auto_rollback_transactions() -> Result<()> {
+    #[test(tokio::test)]
+    async fn rollback_transaction_on_failure() -> Result<()> {
         let db = DB::open(None).await?;
         let _ = db.execute(sqlx::query("CREATE TABLE batchs(uuid)")).await?;
+        db.checkpoint(|_| async { Ok(()) }.boxed()).await?;
 
         // transaction rollback
-        let _ = db
-            .transaction(|mut txn| {
+        assert!(db
+            .transaction::<()>(|txn| {
                 async move {
                     sqlx::query(
                         "INSERT INTO batchs VALUES ('0191b6d0-3d9a-7eb1-88b8-5312737f2ca0')",
                     )
-                    .execute(&mut *txn)
+                    .execute(txn)
                     .await?;
-                    // oops forgot to commit
-                    anyhow::Ok(())
+
+                    Err(anyhow!("oops"))
                 }
                 .boxed()
             })
-            .await?;
+            .await
+            .is_err());
 
         // the transaction was rolled back
         assert_eq!(
@@ -508,12 +545,12 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn snapshot() -> Result<()> {
         // create a blank db, insert some data
         let db = DB::open(None).await?;
         let _ = db
-            .transaction(|mut txn| {
+            .transaction(|txn| {
                 async {
                     sqlx::query("CREATE TABLE batchs(uuid)")
                         .execute(&mut *txn)
@@ -526,7 +563,7 @@ mod tests {
                             .await?;
                     }
 
-                    txn.commit().await
+                    Ok(())
                 }
                 .boxed()
             })
@@ -547,7 +584,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn checkpoint() -> Result<()> {
         // create a blank db, create a table
         let db = DB::open(None).await?;
@@ -568,18 +605,19 @@ mod tests {
 
         // transaction rollback
         let _ = db
-            .transaction(|mut txn| {
+            .transaction::<()>(|txn| {
                 async {
                     sqlx::query(
                         "INSERT INTO batchs VALUES ('0191b6d0-3d9a-7eb1-88b8-5312737f2ca0')",
                     )
-                    .execute(&mut *txn)
+                    .execute(txn)
                     .await?;
-                    txn.rollback().await
+
+                    Err(anyhow!("oops"))
                 }
                 .boxed()
             })
-            .await?;
+            .await;
 
         // checkpoint the db
         let wal_snapshot_2 = db
@@ -671,7 +709,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn rollback() -> Result<()> {
         // create a blank db, create a table
         let db = DB::open(None).await?;
@@ -701,7 +739,7 @@ mod tests {
         assert_eq!(
             1,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db.read_pool)
+                .fetch_one(&mut *db.read_uncommitted().await)
                 .await?,
         );
 
@@ -729,7 +767,7 @@ mod tests {
         assert_eq!(
             1,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db.read_pool)
+                .fetch_one(&mut *db.read_uncommitted().await)
                 .await?,
         );
 
@@ -759,7 +797,7 @@ mod tests {
         assert_eq!(
             2,
             sqlx::query_scalar::<_, i32>("select count(*) from batchs")
-                .fetch_one(&db.read_pool)
+                .fetch_one(&mut *db.read_uncommitted().await)
                 .await?,
         );
 
@@ -777,6 +815,80 @@ mod tests {
                 .fetch_one(&db.read_pool)
                 .await?,
         );
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn isolation() -> Result<()> {
+        // create a blank db, insert initial data and checkpoint
+        let db = DB::open(None).await?;
+        let ack = db
+            .transaction(|txn| {
+                async {
+                    sqlx::query("CREATE TABLE batchs(uuid)")
+                        .execute(&mut *txn)
+                        .await?;
+
+                    for i in 0..10 {
+                        sqlx::query("INSERT INTO batchs VALUES (?1)")
+                            .bind(i)
+                            .execute(&mut *txn)
+                            .await?;
+                    }
+
+                    Ok(())
+                }
+                .boxed()
+            })
+            .await?;
+        db.checkpoint(|_| async { Ok(()) }.boxed()).await?;
+        ack.await?;
+
+        // on the read pool we see the initial data
+        let count: i32 = sqlx::query_scalar("select count(*) from batchs")
+            .fetch_one(&db.read_pool)
+            .await?;
+        assert_eq!(10, count);
+
+        // now let's insert more data
+        let ack = db
+            .transaction(|txn| {
+                async {
+                    for i in 10..20 {
+                        sqlx::query("INSERT INTO batchs VALUES (?1)")
+                            .bind(i)
+                            .execute(&mut *txn)
+                            .await?;
+                    }
+
+                    Ok(())
+                }
+                .boxed()
+            })
+            .await?;
+
+        // these data are not visible on the read pool
+        let count: i32 = sqlx::query_scalar("select count(*) from batchs")
+            .fetch_one(&db.read_pool)
+            .await?;
+        assert_eq!(10, count);
+
+        // but can be see on the read_uncommitted pool
+        let count: i32 = sqlx::query_scalar("select count(*) from batchs")
+            .fetch_one(&mut *db.read_uncommitted().await)
+            .await?;
+        assert_eq!(20, count);
+
+        // checkpoint the db
+        db.checkpoint(|_| async { Ok(()) }.boxed()).await?;
+        ack.await?;
+
+        // now the data are visible
+        let count: i32 = sqlx::query_scalar("select count(*) from batchs")
+            .fetch_one(&db.read_pool)
+            .await?;
+        assert_eq!(20, count);
 
         Ok(())
     }
@@ -808,8 +920,8 @@ mod tests {
                 let mut t = Instant::now();
                 let mut i = 0;
                 loop {
-                    let ack = leader
-                        .transaction(|mut txn| {
+                    if let Ok(ack) = leader
+                        .transaction(|txn| {
                             async {
                                 let count = rand::thread_rng().gen_range(1..=1_000);
                                 for _ in 0..count {
@@ -819,27 +931,26 @@ mod tests {
                                         .await?;
                                 }
                                 if rand::thread_rng().gen_bool(0.75) {
-                                    txn.commit().await?;
-                                    anyhow::Ok(count)
+                                    Ok(count)
                                 } else {
-                                    txn.rollback().await?;
-                                    anyhow::Ok(0)
+                                    Err(anyhow!("oops"))
                                 }
                             }
                             .boxed()
                         })
                         .await
-                        .unwrap();
-                    i += ack.peek();
-                    tokio::spawn({
-                        let inserted = inserted.clone();
-                        async move {
-                            inserted.fetch_add(
-                                ack.await.unwrap_or_default(),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                    });
+                    {
+                        i += ack.peek();
+                        tokio::spawn({
+                            let inserted = inserted.clone();
+                            async move {
+                                inserted.fetch_add(
+                                    ack.await.unwrap_or_default(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        });
+                    }
                     if t.elapsed() > Duration::from_millis(100) {
                         println!("leader: inserted {} rows", i);
                         t = Instant::now();

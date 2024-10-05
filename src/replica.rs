@@ -53,7 +53,7 @@ impl Replica {
         // verify cluster ID
         let db_cluster_id: String =
             sqlx::query_scalar(r#"SELECT value FROM _lbc WHERE key = 'cluster_id'"#)
-                .fetch_one(db.read_pool())
+                .fetch_one(db.read())
                 .await?;
 
         if db_cluster_id != cluster_id {
@@ -107,7 +107,7 @@ impl Replica {
 
             // Initialize the system table
             let ack = db
-                .transaction(|mut txn| {
+                .transaction(|txn| {
                     async move {
                         sqlx::query(r#"CREATE TABLE _lbc (key TEXT PRIMARY KEY, value ANY)"#)
                             .execute(&mut *txn)
@@ -121,7 +121,7 @@ impl Replica {
                             .execute(&mut *txn)
                             .await?;
 
-                        txn.commit().await
+                        Ok(())
                     }
                     .boxed()
                 })
@@ -173,7 +173,7 @@ impl Replica {
     pub async fn last_update(&self) -> Result<DateTime<Utc>> {
         let last_update: String =
             sqlx::query_scalar(r#"SELECT value FROM _lbc WHERE key = 'last_update'"#)
-                .fetch_one(self.db.read_pool())
+                .fetch_one(self.db.read())
                 .await?;
         Ok(DateTime::parse_from_rfc3339(&last_update)
             .context("cannot parse `last_update` date")?
@@ -192,7 +192,7 @@ impl Replica {
                 WHERE key = 'leader'
             "#,
         )
-        .fetch_optional(self.db.read_pool())
+        .fetch_optional(self.db.read())
         .await?;
         Ok(if let Some((uuid, az, address)) = maybe_node {
             Some(Node {
@@ -219,14 +219,14 @@ impl Replica {
 
         let _ = self
             .db
-            .transaction(move |mut txn| {
+            .transaction(move |txn| {
                 async move {
                     sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'last_update'"#)
                         .bind(Utc::now().to_rfc3339())
-                        .execute(&mut *txn)
+                        .execute(txn)
                         .await?;
 
-                    txn.commit().await
+                    Ok(())
                 }
                 .boxed()
             })
@@ -371,7 +371,7 @@ impl Replica {
         let next_epoch = self.next_epoch()?;
 
         // mark us as leader in the DB
-        let leader_ack = self.db.transaction(move |mut txn| async move {
+        let leader_ack = self.db.transaction(move |txn| async move {
             if let Some(leader) = new_leader {
                 sqlx::query(
                     r#"
@@ -390,7 +390,7 @@ impl Replica {
 
             sqlx::query(r#"UPDATE _lbc SET value=?1 WHERE key = 'last_update'"#).bind(Utc::now().to_rfc3339()).execute(&mut *txn).await?;
 
-            txn.commit().await
+            Ok(())
         }.boxed()).await?;
 
         // Try to checkpoint for the next epoch
@@ -627,7 +627,7 @@ mod tests {
 
         // DB works
         let one: u32 = sqlx::query_scalar("SELECT 1")
-            .fetch_one(replica.db.read_pool())
+            .fetch_one(replica.db.read())
             .await?;
         assert_eq!(1, one);
 
@@ -683,7 +683,7 @@ mod tests {
         // leader write to the DB
         let ack = leader
             .db
-            .transaction(|mut txn| {
+            .transaction(|txn| {
                 async move {
                     sqlx::query("CREATE TABLE lol (name TEXT)")
                         .execute(&mut *txn)
@@ -692,7 +692,7 @@ mod tests {
                     sqlx::query("INSERT INTO lol VALUES ('test')")
                         .execute(&mut *txn)
                         .await?;
-                    txn.commit().await
+                    Ok(())
                 }
                 .boxed()
             })
@@ -713,7 +713,7 @@ mod tests {
         assert_eq!(0, follower.snapshot_epoch);
 
         assert!(sqlx::query("SELECT * FROM lol")
-            .fetch_one(follower.db.read_pool())
+            .fetch_one(follower.db.read())
             .await
             .is_err());
 
@@ -726,7 +726,7 @@ mod tests {
 
         // and it can see the data
         let test: String = sqlx::query_scalar("SELECT name FROM lol")
-            .fetch_one(follower.db.read_pool())
+            .fetch_one(follower.db.read())
             .await?;
         assert_eq!("test", test);
 
