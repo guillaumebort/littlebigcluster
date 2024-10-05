@@ -26,7 +26,8 @@ impl Hash for Node {
 }
 
 impl Node {
-    pub fn new(az: String, address: SocketAddr) -> Self {
+    pub fn new(az: impl Into<String>, address: SocketAddr) -> Self {
+        let az = az.into();
         let uuid = Uuid::now_v7();
         Self { uuid, az, address }
     }

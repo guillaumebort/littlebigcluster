@@ -291,7 +291,7 @@ impl LeaderNode {
                 watch_leader_node.clone(),
                 config.clone(),
             )
-            .await,
+            .await?,
         );
 
         // Keep the replica up-to-date and try to acquire leadership

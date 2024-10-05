@@ -26,7 +26,7 @@ impl LeaderClient {
         membership: Membership,
         mut watch_leader: watch::Receiver<Option<Node>>,
         config: Config,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut tasks = JoinSet::new();
         let leader_nodes = if let Some(ref node) = *watch_leader.borrow_and_update() {
             vec![node.clone()]
@@ -51,7 +51,8 @@ impl LeaderClient {
                 }
             }
         });
-        let http2_client = Http2Client::open("leader_client", rx).await;
+        let http2_client =
+            Http2Client::open("leader_client", membership.this().node.clone(), rx).await?;
 
         // will run the gossip protocol
         let node = membership.this().node.clone();
@@ -61,11 +62,11 @@ impl LeaderClient {
             config.clone(),
         ));
 
-        LeaderClient {
+        Ok(LeaderClient {
             node,
             http2_client,
             tasks,
-        }
+        })
     }
 
     async fn gossip(http2_client: Http2Client, membership: Membership, config: Config) {
@@ -85,7 +86,6 @@ impl LeaderClient {
                         },
                         known_members_hash: known_members_hash.clone(),
                     },
-                    config.session_timeout,
                 )
                 .await;
 
@@ -128,11 +128,11 @@ impl LeaderClient {
         // if we are still connected to the leader, signal cleanly that we are going down
         if let Err(err) = self
             .http2_client
-            .json_request::<_, _, Gossip>(
+            .send_json_request::<_, _, Gossip>(
                 Method::POST,
                 "/.lbc/gossip",
                 &Gossip::Dead { node: self.node },
-                Duration::ZERO,
+                false,
             )
             .await
         {

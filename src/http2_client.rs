@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
     extract::Request,
-    http::Uri,
+    http::{HeaderName, HeaderValue, Uri},
     response::{IntoResponse, Response},
 };
 use futures::{
@@ -18,6 +18,7 @@ use futures::{
 };
 use hyper::{
     client::conn::http2::{self, SendRequest},
+    header::CONTENT_TYPE,
     Method,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -37,6 +38,7 @@ use crate::Node;
 #[derive(Clone, Debug)]
 pub struct Http2Client {
     name: String,
+    from: HeaderValue,
     connections: Arc<RwLock<Vec<Http2Connection>>>,
     round_robin_counter: Arc<AtomicUsize>,
     connections_change: Arc<Notify>,
@@ -45,7 +47,14 @@ pub struct Http2Client {
 impl Http2Client {
     const MAX_JSON_BODY: usize = 5 * 1024 * 1024;
 
-    pub async fn open(name: impl Into<String>, mut to: watch::Receiver<Vec<Node>>) -> Self {
+    pub const X_LBC_FROM: HeaderName = HeaderName::from_static("x-lbc-from");
+    pub const X_LBC_TO: HeaderName = HeaderName::from_static("x-lbc-to");
+
+    pub async fn open(
+        name: impl Into<String>,
+        from: Node,
+        mut to: watch::Receiver<Vec<Node>>,
+    ) -> Result<Self> {
         let name = name.into();
         let round_robin_counter = Arc::new(AtomicUsize::new(0));
 
@@ -70,12 +79,16 @@ impl Http2Client {
             Arc::downgrade(&connections),
             connections_change.clone(),
         ));
-        Self {
+
+        let from = HeaderValue::from_str(&from.uuid.to_string())?;
+
+        Ok(Self {
             name,
+            from,
             connections,
             round_robin_counter,
             connections_change,
-        }
+        })
     }
 
     async fn reconnect_in_background(
@@ -139,17 +152,22 @@ impl Http2Client {
         }
     }
 
-    pub async fn send(
+    pub(crate) async fn send_request(
         &self,
         req: Request<Body>,
-        retry_timeout: Duration,
+        retry: bool,
     ) -> Result<Response, (anyhow::Error, Option<Request<Body>>)> {
         let mut req = Some(req);
         let mut exponential_backoff = Duration::from_secs(1);
-        let retry_deadline = tokio::time::Instant::now() + retry_timeout;
         loop {
             let res = match (self.get_connection(), req.take()) {
-                (Some(connection), Some(req)) => Some(connection.send(req)),
+                (Some(connection), Some(mut req)) => {
+                    req.headers_mut()
+                        .insert(Self::X_LBC_FROM, self.from.clone());
+                    req.headers_mut()
+                        .insert(Self::X_LBC_TO, connection.to.clone());
+                    Some(connection.send(req))
+                }
                 (_, old_req) => {
                     req = old_req;
                     None
@@ -161,36 +179,28 @@ impl Http2Client {
                     Err((err, Some(old_req))) => {
                         req = Some(old_req);
                         debug!(?err, "request failed, retrying");
-                        if let Err(_) = tokio::time::timeout_at(
-                            retry_deadline,
-                            tokio::time::sleep(exponential_backoff),
-                        )
-                        .await
-                        {
-                            return Err((anyhow!("timeout waiting for connections"), req));
-                        }
+                        tokio::time::sleep(exponential_backoff).await;
                         exponential_backoff = exponential_backoff.min(Duration::from_secs(30)) * 2;
                     }
                     Err((err, None)) => return Err((err, None)),
                 }
             } else {
                 debug!(client = ?self.name, "no connection available, waiting for new connections");
-                if let Err(_) =
-                    tokio::time::timeout_at(retry_deadline, self.connections_change.notified())
-                        .await
-                {
-                    return Err((anyhow!("timeout waiting for connections"), req));
+                if retry {
+                    self.connections_change.notified().await;
+                } else {
+                    return Err((anyhow!("no connection available"), None));
                 }
             }
         }
     }
 
-    pub async fn json_request<B, U, R>(
+    pub(crate) async fn send_json_request<B, U, R>(
         &self,
         method: Method,
         uri: U,
         body: &B,
-        retry_timeout: Duration,
+        retry: bool,
     ) -> Result<R>
     where
         B: Serialize,
@@ -204,10 +214,10 @@ impl Http2Client {
         let request = Request::builder()
             .method(method)
             .uri(uri)
-            .header("Content-Type", "application/json")
+            .header(CONTENT_TYPE, "application/json")
             .body(body)?;
         let response = self
-            .send(request, retry_timeout)
+            .send_request(request, retry)
             .await
             .map_err(|(e, _)| e)?;
         if response.status().is_success() {
@@ -216,6 +226,22 @@ impl Http2Client {
         } else {
             Err(anyhow!("request failed: {:?}", response))
         }
+    }
+
+    pub async fn request(&self, request: Request) -> Result<Response> {
+        self.send_request(request, true)
+            .await
+            .map_err(|(e, _)| e.into())
+    }
+
+    pub async fn json_request<B, U, R>(&self, method: Method, uri: U, body: &B) -> Result<R>
+    where
+        B: Serialize,
+        U: TryInto<Uri>,
+        <U as TryInto<Uri>>::Error: Into<anyhow::Error>,
+        R: DeserializeOwned,
+    {
+        self.send_json_request(method, uri, body, true).await
     }
 
     fn get_connection(&self) -> Option<MappedRwLockReadGuard<'_, RawRwLock, Http2Connection>> {
@@ -227,11 +253,9 @@ impl Http2Client {
             if connections.is_empty() {
                 None
             } else {
-                let x = connections
+                connections
                     .get(round_robin % connections.len())
-                    .filter(|connection| !connection.is_closed());
-                debug!(client = ?self.name, ?x, "selected connection");
-                x
+                    .filter(|connection| !connection.is_closed())
             }
         })
         .ok()
@@ -250,6 +274,7 @@ impl Http2Client {
 
 struct Http2Connection {
     node: Node,
+    to: HeaderValue,
     sender: Mutex<SendRequest<Body>>,
     is_closed: CancellationToken,
     #[allow(unused)]
@@ -314,9 +339,11 @@ impl Http2Connection {
         let is_closed = close.clone();
         let close = close.drop_guard();
         let sender = Mutex::new(sender);
+        let to = HeaderValue::from_str(&node.uuid.to_string())?;
 
         Ok(Self {
             node,
+            to,
             sender,
             is_closed,
             close,
@@ -349,6 +376,7 @@ impl Http2Connection {
         }
     }
 
+    #[allow(unused)]
     pub fn close(&self) {
         self.is_closed.cancel();
     }
@@ -356,7 +384,8 @@ impl Http2Connection {
 
 #[cfg(test)]
 mod tests {
-    use axum::{extract::State, routing::get, Json};
+    use axum::{debug_handler, extract::State, routing::get, Json};
+    use hyper::HeaderMap;
     use test_log::test;
     use tracing::info;
 
@@ -384,14 +413,25 @@ mod tests {
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone().drop_guard();
         let requests_count = Arc::new(AtomicUsize::new(0));
-        let state = (requests_count.clone(), server.clone());
+        let state = (requests_count.clone(), server.clone(), node.clone());
         tokio::spawn(async move {
+            #[debug_handler]
             async fn yo(
-                State((requests_count, server)): State<(Arc<AtomicUsize>, String)>,
+                State((requests_count, server, node)): State<(Arc<AtomicUsize>, String, Node)>,
+                headers: HeaderMap,
                 Json(payload): Json<String>,
             ) -> impl IntoResponse {
                 requests_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                debug!(?server, payload, "yo");
+                debug!(?server, ?headers, payload, "yo");
+                assert_eq!(
+                    headers
+                        .get(Http2Client::X_LBC_TO)
+                        .unwrap_or(&HeaderValue::from_static("?"))
+                        .to_str()
+                        .unwrap_or_default(),
+                    node.uuid.to_string()
+                );
+                assert!(headers.get(Http2Client::X_LBC_FROM).is_some(),);
                 Json("yo")
             }
 
@@ -421,14 +461,13 @@ mod tests {
         let (_, nodes) = watch::channel(vec![server.node.clone()]);
 
         // let's connect to the server
-        let client = Http2Client::open("test", nodes).await;
+        let client =
+            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
 
         debug!("client connected");
 
         // we can send a request
-        let res: String = client
-            .json_request(Method::GET, "/yo", &"1", Duration::ZERO)
-            .await?;
+        let res: String = client.json_request(Method::GET, "/yo", &"1").await?;
         assert_eq!(res, "yo");
 
         Ok(())
@@ -440,11 +479,12 @@ mod tests {
         let (_, nodes) = watch::channel(vec![]);
 
         // let's connect to the server
-        let client = Http2Client::open("test", nodes).await;
+        let client =
+            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
 
         // we can send a request
         let res: Result<String> = client
-            .json_request(Method::GET, "/yo", &"1", Duration::ZERO)
+            .send_json_request(Method::GET, "/yo", &"1", false)
             .await;
 
         // because we specified a retry timeout of 0, we should get an error
@@ -459,11 +499,12 @@ mod tests {
         let (update_nodes, nodes) = watch::channel(vec![]);
 
         // let's connect to the server
-        let client = Http2Client::open("test", nodes).await;
+        let client =
+            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
 
         // we can send a request
         let mut res = client
-            .json_request::<_, _, String>(Method::GET, "/yo", &"1", Duration::from_secs(30))
+            .json_request::<_, _, String>(Method::GET, "/yo", &"1")
             .boxed();
 
         // for now the client is still waiting for a connection
@@ -491,12 +532,11 @@ mod tests {
 
         // the client only knows about the first server
         update_nodes.send(vec![server1.node.clone()])?;
-        let client = Http2Client::open("test", nodes).await;
+        let client =
+            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
 
         // we can send a request
-        let res: String = client
-            .json_request(Method::GET, "/yo", &"1", Duration::from_secs(30))
-            .await?;
+        let res: String = client.json_request(Method::GET, "/yo", &"1").await?;
         assert_eq!(res, "yo");
         assert_eq!(1, server1.count_requests());
 
@@ -506,9 +546,7 @@ mod tests {
         update_nodes.send(vec![server2.node.clone()])?;
 
         // we can send a request
-        let res: String = client
-            .json_request(Method::GET, "/yo", &"2", Duration::from_secs(30))
-            .await?;
+        let res: String = client.json_request(Method::GET, "/yo", &"2").await?;
         assert_eq!(res, "yo");
         assert_eq!(1, server2.count_requests());
 
@@ -525,12 +563,13 @@ mod tests {
 
         // the client only knows about both servers
         update_nodes.send(vec![server1.node.clone(), server2.node.clone()])?;
-        let client = Http2Client::open("test", nodes).await;
+        let client =
+            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
 
         // let's make 10 requests
         for i in 0..10 {
             let res: String = client
-                .json_request(Method::GET, "/yo", &i.to_string(), Duration::from_secs(30))
+                .json_request(Method::GET, "/yo", &i.to_string())
                 .await?;
             assert_eq!(res, "yo");
         }
@@ -546,7 +585,7 @@ mod tests {
         // let's make 10 more requests
         for i in 0..10 {
             let res: String = client
-                .json_request(Method::GET, "/yo", &i.to_string(), Duration::from_secs(30))
+                .json_request(Method::GET, "/yo", &i.to_string())
                 .await?;
             assert_eq!(res, "yo");
         }

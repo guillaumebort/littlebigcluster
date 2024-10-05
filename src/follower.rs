@@ -164,7 +164,7 @@ impl FollowerNode {
 
         // Start an http2 client always connected to the current leader
         let leader_client =
-            LeaderClient::new(membership.clone(), watch_leader_node.clone(), config).await;
+            LeaderClient::new(membership.clone(), watch_leader_node.clone(), config).await?;
 
         Ok(Self {
             node,

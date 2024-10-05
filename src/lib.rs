@@ -18,6 +18,7 @@ use leader::LeaderNode;
 pub use leader::{Leader, LeaderState, LeaderStatus};
 use object_store::ObjectStore;
 use replica::Replica;
+pub use http2_client::Http2Client;
 
 pub struct LittleBigCluster {
     cluster_id: String,
