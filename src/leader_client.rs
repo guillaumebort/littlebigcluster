@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use hyper::Method;
 use tokio::{
     sync::watch,
@@ -11,7 +12,7 @@ use tracing::{debug, error};
 use crate::{
     gossip::{Gossip, Member, MembersHash, Membership},
     http2_client::Http2Client,
-    Config, Node,
+    Node,
 };
 
 #[derive(Debug)]
@@ -25,7 +26,6 @@ impl LeaderClient {
     pub async fn new(
         membership: Membership,
         mut watch_leader: watch::Receiver<Option<Node>>,
-        config: Config,
     ) -> Result<Self> {
         let mut tasks = JoinSet::new();
         let leader_nodes = if let Some(ref node) = *watch_leader.borrow_and_update() {
@@ -56,11 +56,7 @@ impl LeaderClient {
 
         // will run the gossip protocol
         let node = membership.this().node.clone();
-        tasks.spawn(Self::gossip(
-            http2_client.clone(),
-            membership,
-            config.clone(),
-        ));
+        tasks.spawn(Self::gossip(http2_client.clone(), membership));
 
         Ok(LeaderClient {
             node,
@@ -69,7 +65,7 @@ impl LeaderClient {
         })
     }
 
-    async fn gossip(http2_client: Http2Client, membership: Membership, config: Config) {
+    async fn gossip(http2_client: Http2Client, membership: Membership) {
         let mut known_members_hash = MembersHash::ZERO;
         let mut sleep_duration = Duration::ZERO;
 
@@ -98,18 +94,9 @@ impl LeaderClient {
             .min(Duration::from_secs(30));
 
             match res {
-                Ok(Gossip::Rumors {
-                    alive,
-                    dead,
-                    members_hash,
-                    ..
-                }) => {
-                    membership.update(alive, dead);
+                Ok(ref gossip @ Gossip::Rumors { members_hash, .. }) => {
+                    membership.gossip(Utc::now(), gossip.clone());
                     known_members_hash = members_hash;
-                    sleep_duration = Duration::ZERO;
-                }
-                Ok(_) => {
-                    error!("Unexpected response from leader");
                 }
                 err => {
                     debug!(?err, "Failed to gossip")

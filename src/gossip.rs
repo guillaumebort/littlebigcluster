@@ -2,10 +2,12 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::Arc,
 };
 
+use anyhow::Result;
 use chrono::{DateTime, Utc};
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -89,11 +91,11 @@ impl Membership {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(config.session_timeout).await;
-                    let state = state.lock().unwrap();
+                    let state = state.lock();
                     if state.updates_tx.is_closed() {
                         break;
                     }
-                    Self::gc(state, &config);
+                    Self::gc(state, Utc::now(), &config);
                 }
             });
         }
@@ -104,8 +106,75 @@ impl Membership {
         }
     }
 
+    pub fn watch(&self) -> &watch::Receiver<Members> {
+        &self.updates_rx
+    }
+
+    fn update_state(
+        now: DateTime<Utc>,
+        mut state: MutexGuard<MembershipState>,
+        alives: Vec<(DateTime<Utc>, Member)>,
+        deads: Vec<Node>,
+        config: &Config,
+    ) {
+        let this_uuid = state.this.node.uuid;
+        for alive in alives {
+            state.alive.insert(alive.1.node.uuid, alive);
+        }
+        for dead in deads {
+            state.alive.remove(&dead.uuid);
+            state.dead.insert(dead.uuid, (Utc::now(), dead));
+        }
+
+        {
+            let this = state.this.clone();
+            state.alive.insert(this.node.uuid, (Utc::now(), this));
+        }
+        state.alive.retain(|uuid, (seen, _old)| {
+            *uuid == this_uuid
+                || (now - *seen).to_std().unwrap_or_default() < config.session_timeout
+        });
+        state.dead.retain(|_, (seen, _)| {
+            (now - *seen).to_std().unwrap_or_default() < config.session_timeout
+        });
+
+        state.updates_tx.send_if_modified(|current| {
+            let hash = MembersHash::from(state.alive.values().map(|(_, member)| member));
+            if hash != current.hash {
+                *current = Members {
+                    members: state
+                        .alive
+                        .values()
+                        .map(|(_, member)| member)
+                        .cloned()
+                        .collect::<HashSet<_>>(),
+                    hash,
+                };
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub fn gossip(&self, now: DateTime<Utc>, gossip: Gossip) {
+        let state = self.state.lock();
+        match gossip {
+            Gossip::Alive { member, .. } => {
+                Self::update_state(now, state, vec![(now, member)], vec![], &self.config)
+            }
+            Gossip::Dead { node } => {
+                Self::update_state(now, state, vec![], vec![node], &self.config)
+            }
+            Gossip::Rumors { alive, dead, .. } => {
+                Self::update_state(now, state, alive, dead, &self.config)
+            }
+            Gossip::Noop => {}
+        }
+    }
+
     pub fn rumors(&self) -> Gossip {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         let alive = state.alive.values().cloned().collect();
         let dead = state.dead.values().map(|(_, node)| node).cloned().collect();
         let members_hash = state.updates_tx.borrow().hash;
@@ -116,28 +185,11 @@ impl Membership {
         }
     }
 
-    pub fn watch(&self) -> &watch::Receiver<Members> {
-        &self.updates_rx
-    }
-
-    pub fn update(&self, alives: Vec<(DateTime<Utc>, Member)>, deads: Vec<Node>) {
-        let mut state = self.state.lock().unwrap();
-        for alive in alives {
-            state.alive.insert(alive.1.node.uuid, alive);
-        }
-        for dead in deads {
-            state.alive.remove(&dead.uuid);
-            state.dead.insert(dead.uuid, (Utc::now(), dead));
-        }
-        Self::gc(state, &self.config);
-    }
-
     pub fn this(&self) -> Member {
-        self.state.lock().unwrap().this.clone()
+        self.state.lock().this.clone()
     }
 
-    fn gc(mut state: MutexGuard<MembershipState>, config: &Config) {
-        let now = Utc::now();
+    fn gc(mut state: MutexGuard<MembershipState>, now: DateTime<Utc>, config: &Config) {
         {
             let this = state.this.clone();
             state.alive.insert(this.node.uuid, (Utc::now(), this));
@@ -213,5 +265,125 @@ pub enum Gossip {
         dead: Vec<Node>,
         members_hash: MembersHash,
     },
-    GoodBye,
+    Noop,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use test_log::test;
+
+    use super::*;
+
+    #[test(tokio::test)]
+    async fn watch_members() -> Result<()> {
+        let now = Utc::now();
+        let membership = Membership::new(
+            Member {
+                node: Node::new("az1", "127.0.0.1:8080".parse()?),
+                roles: vec![],
+            },
+            Default::default(),
+        );
+
+        let mut members = membership.watch().clone();
+        assert!(!members.has_changed()?);
+        assert_eq!(1, members.borrow_and_update().members.len());
+
+        // Discovered a new node
+        let another_node = Node::new("az1", "127.0.0.1:8081".parse()?);
+        membership.gossip(
+            now,
+            Gossip::Alive {
+                member: Member {
+                    node: another_node.clone(),
+                    roles: vec![],
+                },
+                known_members_hash: MembersHash::ZERO,
+            },
+        );
+
+        assert!(members.has_changed()?);
+        assert_eq!(2, members.borrow_and_update().members.len());
+
+        // see the same node again
+        membership.gossip(
+            now,
+            Gossip::Alive {
+                member: Member {
+                    node: another_node.clone(),
+                    roles: vec![],
+                },
+                known_members_hash: MembersHash::ZERO,
+            },
+        );
+
+        assert!(!members.has_changed()?);
+        assert_eq!(2, members.borrow_and_update().members.len());
+
+        // and now the member is gone
+        membership.gossip(
+            now,
+            Gossip::Dead {
+                node: another_node.clone(),
+            },
+        );
+
+        assert!(members.has_changed()?);
+        assert_eq!(1, members.borrow_and_update().members.len());
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn session_timeout() -> Result<()> {
+        let membership = Membership::new(
+            Member {
+                node: Node::new("az1", "127.0.0.1:8080".parse()?),
+                roles: vec![],
+            },
+            Config {
+                session_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+        );
+
+        let mut members = membership.watch().clone();
+        assert!(!members.has_changed()?);
+        assert_eq!(1, members.borrow_and_update().members.len());
+
+        // Discovered a new node
+        let now = Utc::now();
+        let another_node = Node::new("az1", "127.0.0.1:8081".parse()?);
+        membership.gossip(
+            now,
+            Gossip::Alive {
+                member: Member {
+                    node: another_node.clone(),
+                    roles: vec![],
+                },
+                known_members_hash: MembersHash::ZERO,
+            },
+        );
+
+        assert!(members.has_changed()?);
+        assert_eq!(2, members.borrow_and_update().members.len());
+
+        // But we have not seen the node for a while
+        membership.gossip(
+            Utc::now() + Duration::from_secs(2),
+            Gossip::Rumors {
+                alive: vec![],
+                dead: vec![],
+                members_hash: MembersHash(0),
+            },
+        );
+
+        assert!(members.has_changed()?);
+        assert_eq!(1, members.borrow_and_update().members.len());
+
+        Ok(())
+    }
 }

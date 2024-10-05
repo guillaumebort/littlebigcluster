@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.31.0", features = ["full"] }
-tokio-util = "0.7.7"
-object_store = "0.8.0"
+tokio = { version = "1.40.0", features = ["full", "test-util"] }
+tokio-util = "0.7.11"
+object_store = "0.11.0"
 anyhow = "1.0.44"
 async-channel = "1.9"
 fallible-iterator = "0.3.0"

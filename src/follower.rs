@@ -48,7 +48,7 @@ impl ClusterState {
         }
     }
 
-    pub fn db(&self) -> impl Executor<Database = Sqlite> {
+    pub fn read(&self) -> impl Executor<Database = Sqlite> {
         self.inner.db.read()
     }
 
@@ -74,7 +74,7 @@ pub trait Follower {
 
     fn watch_epoch(&self) -> &watch::Receiver<u64>;
 
-    fn db(&self) -> impl Executor<Database = Sqlite>;
+    fn read(&self) -> impl Executor<Database = Sqlite>;
 
     fn leader_client(&self) -> &LeaderClient;
 
@@ -164,7 +164,7 @@ impl FollowerNode {
 
         // Start an http2 client always connected to the current leader
         let leader_client =
-            LeaderClient::new(membership.clone(), watch_leader_node.clone(), config).await?;
+            LeaderClient::new(membership.clone(), watch_leader_node.clone()).await?;
 
         Ok(Self {
             node,
@@ -248,7 +248,7 @@ impl Follower for FollowerNode {
         &self.watch_epoch
     }
 
-    fn db(&self) -> impl Executor<Database = Sqlite> {
+    fn read(&self) -> impl Executor<Database = Sqlite> {
         self.db.read()
     }
 

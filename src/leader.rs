@@ -96,8 +96,12 @@ impl LeaderState {
         self.inner.leader_status.is_leader()
     }
 
-    pub fn db(&self) -> impl Executor<Database = Sqlite> {
+    pub fn read(&self) -> impl Executor<Database = Sqlite> {
         self.inner.db.read()
+    }
+
+    pub async fn read_uncommitted(&self) -> tokio::sync::MappedMutexGuard<'_, SqliteConnection> {
+        self.inner.db.read_uncommitted().await
     }
 
     pub fn roles(&self) -> &[String] {
@@ -140,8 +144,6 @@ pub trait Leader {
 
     fn wait_for_lost_leadership(&self) -> impl Future<Output = Result<()>>;
 
-    fn db(&self) -> impl Executor<Database = Sqlite>;
-
     fn object_store(&self) -> &Arc<dyn ObjectStore>;
 
     fn watch_leader(&self) -> &watch::Receiver<Option<Node>>;
@@ -153,6 +155,12 @@ pub trait Leader {
     fn address(&self) -> SocketAddr;
 
     fn node(&self) -> &Node;
+
+    fn read(&self) -> impl Executor<Database = Sqlite>;
+
+    fn read_uncommitted(
+        &self,
+    ) -> impl Future<Output = tokio::sync::MappedMutexGuard<'_, SqliteConnection>>;
 
     fn transaction<A>(
         &self,
@@ -283,14 +291,8 @@ impl LeaderNode {
         let (epoch_updates, watch_epoch) = watch::channel(replica.read().await.epoch());
 
         // HTTP client connected to the leader
-        let leader_client = Arc::new(
-            LeaderClient::new(
-                membership.clone(),
-                watch_leader_node.clone(),
-                config.clone(),
-            )
-            .await?,
-        );
+        let leader_client =
+            Arc::new(LeaderClient::new(membership.clone(), watch_leader_node.clone()).await?);
 
         // Keep the replica up-to-date and try to acquire leadership
         let mut tasks = JoinSet::new();
@@ -523,8 +525,12 @@ impl Leader for LeaderNode {
         self.node.address
     }
 
-    fn db(&self) -> impl Executor<Database = Sqlite> {
+    fn read(&self) -> impl Executor<Database = Sqlite> {
         self.db.read()
+    }
+
+    async fn read_uncommitted(&self) -> tokio::sync::MappedMutexGuard<'_, SqliteConnection> {
+        self.db.read_uncommitted().await
     }
 
     fn node(&self) -> &Node {
@@ -630,25 +636,21 @@ async fn status(State(state): State<LeaderState>) -> JsonResponse<Value> {
             "size": tokio::fs::metadata(replica.db().path()).await?.len(),
         },
         "is_leader": state.is_leader(),
-        "members": state.inner.membership.rumors(),
+        "members": *state.inner.membership.watch().borrow().to_vec(),
     })))
 }
 
 #[debug_handler]
 async fn gossip(
     State(state): State<LeaderState>,
-    Json(payload): Json<Gossip>,
+    Json(gossip): Json<Gossip>,
 ) -> JsonResponse<Gossip> {
-    match payload {
-        Gossip::Alive {
-            member,
-            known_members_hash,
-        } => {
-            state
-                .inner
-                .membership
-                .update(vec![(Utc::now(), member)], vec![]);
+    state.inner.membership.gossip(Utc::now(), gossip.clone());
 
+    match gossip {
+        Gossip::Alive {
+            known_members_hash, ..
+        } => {
             if known_members_hash == state.inner.membership.watch().borrow().hash {
                 let mut watch_members = state.inner.membership.watch().clone();
                 let members_changed =
@@ -657,17 +659,13 @@ async fn gossip(
                     _ = members_changed => {}
                     _ = tokio::time::sleep(state.config().session_timeout / 2) => {}
                     _ = state.inner.graceful_shutdown.notified() => {
-                        state.inner.membership.update(vec![], vec![state.this().clone()]);
+                        state.inner.membership.gossip(Utc::now(), Gossip::Dead { node: state.this().clone() });
                     }
                 }
             }
 
             Ok(Json(state.inner.membership.rumors()))
         }
-        Gossip::Dead { node } => {
-            state.inner.membership.update(vec![], vec![node]);
-            Ok(Json(Gossip::GoodBye))
-        }
-        _ => Err(anyhow!("Unexpected gossip message"))?,
+        _ => Ok(Json(Gossip::Noop)),
     }
 }
