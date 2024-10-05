@@ -257,8 +257,8 @@ impl LeaderNode {
         let graceful_shutdown = Arc::new(Notify::new());
 
         // Start the server
-        let leader_router = {
-            let state = LeaderState::new(
+        let router = compose_routers(
+            LeaderState::new(
                 node.clone(),
                 roles.clone(),
                 leader_status.clone(),
@@ -267,21 +267,12 @@ impl LeaderNode {
                 graceful_shutdown.clone(),
                 config.clone(),
             )
-            .await;
-            let system_router = Router::new()
-                .route("/status", get(status))
-                .route("/gossip", post(gossip));
-            let router = Router::new()
-                .nest("/.lbc", system_router)
-                .merge(router)
-                .with_state(state.clone());
-            router.layer(middleware::from_fn_with_state(state.clone(), leader_only))
-        };
-        let additional_router = {
-            let state = ClusterState::new(node.clone(), roles.clone(), replica.clone()).await;
-            additional_router.with_state(state)
-        };
-        let server = Server::start(tcp_listener, leader_router.merge(additional_router)).await?;
+            .await,
+            router,
+            additional_router,
+        )
+        .await;
+        let server = Server::start(tcp_listener, router).await?;
 
         // Watch leader updates
         let (leader_updates, watch_leader_node) =
@@ -312,7 +303,6 @@ impl LeaderNode {
                     leader_status.set_leader(false);
                     if let Err(err) = res {
                         error!(?err);
-                        panic!("Failed to acquire leadership: {err:#?}");
                     }
                 }
             }),
@@ -461,6 +451,14 @@ impl LeaderNode {
         is_leader.set_leader(false);
         Err(anyhow!("Lost leadership"))
     }
+
+    fn check_db_rw(&self) -> Result<()> {
+        if self.leader_status.is_leader() {
+            Ok(())
+        } else {
+            Err(anyhow!("Not the leader, cannot write to the DB"))
+        }
+    }
 }
 
 impl Leader for LeaderNode {
@@ -544,30 +542,21 @@ impl Leader for LeaderNode {
     where
         A: Send + Unpin + 'static,
     {
-        if self.leader_status.is_leader() {
-            self.db.transaction(thunk).await
-        } else {
-            Err(anyhow!("Not the leader"))
-        }
+        self.check_db_rw()?;
+        self.db.transaction(thunk).await
     }
 
     async fn execute<'a>(
         &'a self,
         query: sqlx::query::Query<'a, Sqlite, <Sqlite as sqlx::Database>::Arguments<'a>>,
     ) -> Result<Ack<SqliteQueryResult>> {
-        if self.leader_status.is_leader() {
-            self.db.execute(query).await
-        } else {
-            Err(anyhow!("Not the leader"))
-        }
+        self.check_db_rw()?;
+        self.db.execute(query).await
     }
 
     async fn execute_batch(&self, query: sqlx::RawSql<'static>) -> Result<Ack<SqliteQueryResult>> {
-        if self.leader_status.is_leader() {
-            self.db.execute_batch(query).await
-        } else {
-            Err(anyhow!("Not the leader"))
-        }
+        self.check_db_rw()?;
+        self.db.execute_batch(query).await
     }
 
     fn object_store(&self) -> &Arc<dyn ObjectStore> {
@@ -588,6 +577,35 @@ impl Leader for LeaderNode {
 }
 
 // ----- Server
+
+pub const STATUS_URL: &str = "/.lbc/status";
+pub const GOSSIP_URL: &str = "/.lbc/gossip";
+
+async fn compose_routers(
+    state: LeaderState,
+    leader_router: Router<LeaderState>,
+    additional_router: Router<ClusterState>,
+) -> Router {
+    let cluster_state = ClusterState::new(
+        state.inner.node.clone(),
+        state.inner.roles.clone(),
+        state.inner.replica.clone(),
+    )
+    .await;
+    let leader_router = {
+        let system_router = Router::new()
+            .route(STATUS_URL, get(status))
+            .route(GOSSIP_URL, post(gossip));
+        let leader_router =
+            leader_router.layer(middleware::from_fn_with_state(state.clone(), leader_only));
+        Router::new()
+            .merge(system_router)
+            .merge(leader_router)
+            .with_state(state.clone())
+    };
+    let additional_router = additional_router.with_state(cluster_state);
+    leader_router.merge(additional_router)
+}
 
 async fn leader_only(State(state): State<LeaderState>, request: Request, next: Next) -> Response {
     if state.is_leader() {
@@ -667,5 +685,204 @@ async fn gossip(
             Ok(Json(state.inner.membership.rumors()))
         }
         _ => Ok(Json(Gossip::Noop)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+    use test_log::test;
+
+    use super::*;
+
+    struct TmpObjectStore {
+        #[allow(unused)]
+        tmp: TempDir,
+        object_store: Arc<dyn ObjectStore>,
+    }
+
+    impl TmpObjectStore {
+        async fn new() -> Result<Self> {
+            let tmp = tempfile::tempdir()?;
+            let object_store = Arc::new(LocalFileSystem::new_with_prefix(tmp.path())?);
+            let tmp = Self { tmp, object_store };
+            // init replica
+            Replica::init("test", &tmp.object_store).await?;
+            Ok(tmp)
+        }
+    }
+
+    #[test(tokio::test)]
+    async fn start_leader() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+        let config = Config {
+            epoch_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        // start a leader node
+        let leader = LeaderNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            Router::new(),
+            tmp.object_store,
+            vec![],
+            config,
+        )
+        .await?;
+
+        // this leader node is alone and should become the leader
+        leader.wait_for_leadership().await?;
+        assert!(leader.leader_status.is_leader());
+
+        // this leader is alone in the cluster
+        assert_eq!(1, leader.watch_members().borrow().to_vec().len());
+
+        // we can reach it's API
+        reqwest::get(format!("http://{}/yo", leader.address()).as_str())
+            .await?
+            .error_for_status()?;
+
+        // we can get its status
+        reqwest::get(format!("http://{}{}", leader.address(), STATUS_URL).as_str())
+            .await?
+            .error_for_status()?;
+
+        // we can use the DB in RW mode
+        let ack = leader.execute(sqlx::query("SELECT 1")).await?;
+
+        // ack will be eventually committed
+        assert_eq!(1, ack.await?.rows_affected());
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn standby_leader() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+        let config = Config {
+            epoch_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        // start a leader node
+        let leader = LeaderNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            Router::new(),
+            tmp.object_store.clone(),
+            vec![],
+            config.clone(),
+        )
+        .await?;
+        leader.wait_for_leadership().await?;
+
+        // let's start a standby leader
+        let standby_leader = LeaderNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            Router::new(),
+            tmp.object_store,
+            vec![],
+            config.clone(),
+        )
+        .await?;
+
+        // the standby leader follows the leader
+        let mut epoch_watcher = standby_leader.watch_epoch().clone();
+        epoch_watcher.mark_unchanged();
+        epoch_watcher.changed().await?;
+
+        // but it's not the leader
+        assert!(!standby_leader.leader_status.is_leader());
+
+        // so we can't reach it's API
+        assert_eq!(
+            reqwest::get(format!("http://{}/yo", standby_leader.address()).as_str())
+                .await?
+                .status(),
+            503
+        );
+
+        // but we can get its status
+        reqwest::get(format!("http://{}{}", standby_leader.address(), STATUS_URL).as_str())
+            .await?
+            .error_for_status()?;
+
+        // we can't use the standby DB in RW mode
+        assert!(standby_leader
+            .execute(sqlx::query("SELECT 1"))
+            .await
+            .is_err());
+
+        // now the leader shutdown
+        leader.shutdown().await?;
+
+        // the standby leader should become the leader
+        standby_leader.wait_for_leadership().await?;
+        assert!(standby_leader.leader_status.is_leader());
+
+        // we can reach it's API
+        reqwest::get(format!("http://{}/yo", standby_leader.address()).as_str())
+            .await?
+            .error_for_status()?;
+
+        // and we can use the DB in RW mode
+        let ack = standby_leader.execute(sqlx::query("SELECT 1")).await?;
+        ack.await?;
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn fence_leader() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+        let config = Config {
+            epoch_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        // start a leader node
+        let leader = LeaderNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            Router::new(),
+            tmp.object_store.clone(),
+            vec![],
+            config.clone(),
+        )
+        .await?;
+        leader.wait_for_leadership().await?;
+
+        // open another replica for the same cluster
+        let mut replica = Replica::open("test", &tmp.object_store, config).await?;
+
+        // let force a fence
+        while let Err(_) = replica.try_change_leader(None).await {
+            debug!("Failed to fence leader, retrying...");
+            replica.follow().await?;
+        }
+
+        // so now the leader should have lost leadership
+        leader.wait_for_lost_leadership().await?;
+        assert!(!leader.leader_status.is_leader());
+
+        // so we can't reach it's API
+        assert_eq!(
+            reqwest::get(format!("http://{}/yo", leader.address()).as_str())
+                .await?
+                .status(),
+            503
+        );
+
+        // and we can't use the DB in RW mode
+        assert!(leader.execute(sqlx::query("SELECT 1")).await.is_err());
+
+        Ok(())
     }
 }

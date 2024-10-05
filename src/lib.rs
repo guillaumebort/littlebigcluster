@@ -121,7 +121,7 @@ pub struct Config {
 
 impl Config {
     pub fn snapshot_interval_epochs(&self) -> u64 {
-        self.snapshot_interval.as_secs() / self.epoch_interval.as_secs()
+        self.snapshot_interval.as_secs().max(1) / self.epoch_interval.as_secs().max(1)
     }
 
     pub fn client_retry_timeout(&self) -> Duration {

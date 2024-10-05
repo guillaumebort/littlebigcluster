@@ -36,3 +36,4 @@ tracing-subscriber = { version = "0.3", features = ["ansi"] }
 ascii_table = { version = "4.0.4", features = ["color_codes"] }
 colored = "2.1.0"
 test-log = { version = "0.2", features = ["trace"] }
+reqwest = "0.12"

@@ -90,11 +90,15 @@ impl Replica {
         Ok(replica)
     }
 
-    pub async fn init(cluster_id: String, object_store: &Arc<dyn ObjectStore>) -> Result<()> {
+    pub async fn init(
+        cluster_id: impl Into<String>,
+        object_store: &Arc<dyn ObjectStore>,
+    ) -> Result<()> {
         // Create a new (fresh) DB
         let db = DB::open(None).await?;
         {
             let object_store = object_store.clone();
+            let cluster_id = cluster_id.into();
 
             // Verify that there is no file in the WAL path already
             if let Some(object) = object_store
@@ -298,7 +302,8 @@ impl Replica {
         let first_epoch_to_vacuum =
             Self::read_marker(&self.object_store, Self::LAST_VACUUM_PATH).await?;
         let mut last_epoch_to_vacuum = self.epoch.saturating_sub(
-            self.config.retention_period.as_secs() / self.config.epoch_interval.as_secs(),
+            self.config.retention_period.as_secs().max(1)
+                / self.config.epoch_interval.as_secs().max(1),
         );
 
         // in any case we don't vacuum past the last snapshot

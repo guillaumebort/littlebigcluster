@@ -12,6 +12,7 @@ use tracing::{debug, error};
 use crate::{
     gossip::{Gossip, Member, MembersHash, Membership},
     http2_client::Http2Client,
+    leader::GOSSIP_URL,
     Node,
 };
 
@@ -23,6 +24,8 @@ pub struct LeaderClient {
 }
 
 impl LeaderClient {
+    const MAX_EXPONENTIAL_BACKOFF: Duration = Duration::from_secs(30);
+
     pub async fn new(
         membership: Membership,
         mut watch_leader: watch::Receiver<Option<Node>>,
@@ -74,7 +77,7 @@ impl LeaderClient {
             let res: Result<Gossip> = http2_client
                 .json_request(
                     Method::POST,
-                    "/.lbc/gossip",
+                    GOSSIP_URL,
                     &Gossip::Alive {
                         member: Member {
                             node: this.node,
@@ -91,7 +94,7 @@ impl LeaderClient {
             } else {
                 sleep_duration * 2
             })
-            .min(Duration::from_secs(30));
+            .min(Self::MAX_EXPONENTIAL_BACKOFF);
 
             match res {
                 Ok(ref gossip @ Gossip::Rumors { members_hash, .. }) => {
@@ -117,7 +120,7 @@ impl LeaderClient {
             .http2_client
             .send_json_request::<_, _, Gossip>(
                 Method::POST,
-                "/.lbc/gossip",
+                GOSSIP_URL,
                 &Gossip::Dead { node: self.node },
                 false,
             )
@@ -125,6 +128,111 @@ impl LeaderClient {
         {
             debug!(?err, "Failed to send dead message to leader");
         }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{debug_handler, extract::State, response::IntoResponse, routing::post, Json};
+    use test_log::test;
+    use tokio::select;
+    use tokio_util::sync::{CancellationToken, DropGuard};
+    use tracing::info;
+
+    use super::*;
+    use crate::Config;
+
+    struct FakeLeader {
+        node: Node,
+        membership: Membership,
+        #[allow(unused)]
+        shutdown: DropGuard,
+    }
+
+    async fn start_fake_leader() -> Result<FakeLeader> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let node = Node::new("az".to_owned(), listener.local_addr()?);
+        info!(?node, "server started");
+        let cancel = CancellationToken::new();
+        let shutdown = cancel.clone().drop_guard();
+        let membership = Membership::new(
+            Member {
+                node: node.clone(),
+                roles: vec![],
+            },
+            Default::default(),
+        );
+        let state = membership.clone();
+        tokio::spawn(async move {
+            #[debug_handler]
+            async fn gossip(
+                State(membership): State<Membership>,
+                Json(gossip): Json<Gossip>,
+            ) -> impl IntoResponse {
+                membership.gossip(Utc::now(), gossip);
+                Json(membership.rumors())
+            }
+
+            let router = axum::Router::new()
+                .route(GOSSIP_URL, post(gossip))
+                .with_state(state);
+
+            select! {
+                _ = cancel.cancelled() => {}
+                _ = axum::serve(listener, router) => {}
+            }
+
+            info!("server stopped");
+        });
+        Ok(FakeLeader {
+            node,
+            membership,
+            shutdown,
+        })
+    }
+
+    #[test(tokio::test)]
+    async fn test_leader_client() -> Result<()> {
+        let this = Node::new("xx", "127.0.0.1:3333".parse()?);
+        let client_membership = Membership::new(
+            Member {
+                node: this.clone(),
+                roles: vec![],
+            },
+            Config {
+                ..Default::default()
+            },
+        );
+
+        // open a leader client (but we have no leader yet)
+        let (tx, rx) = watch::channel(None);
+        let client = LeaderClient::new(client_membership.clone(), rx).await?;
+        let mut client_members = client_membership.watch().clone();
+
+        assert_eq!(1, client_members.borrow_and_update().to_vec().len());
+
+        // start a fake leader
+        let fake_leader = start_fake_leader().await?;
+        let mut leader_members = fake_leader.membership.watch().clone();
+
+        // the leader client should connect to the leader
+        tx.send(Some(fake_leader.node.clone()))?;
+
+        // so it will eventually tell the leader that it is alive, and the membership will be updated
+        client_members.changed().await?;
+        assert_eq!(2, client_members.borrow_and_update().to_vec().len());
+
+        // the server sees 2 members as well
+        assert_eq!(2, leader_members.borrow_and_update().to_vec().len());
+
+        // now shutdown the leader client
+        client.shutdown().await?;
+
+        // the leader should see that the client is dead
+        leader_members.changed().await?;
+        assert_eq!(1, leader_members.borrow_and_update().to_vec().len());
 
         Ok(())
     }
