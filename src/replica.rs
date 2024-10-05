@@ -17,7 +17,7 @@ use tokio::{
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
-use crate::{config::Config, db::DB, Node};
+use crate::{db::DB, Config, Node};
 
 #[derive(Debug)]
 pub(crate) struct Replica {
@@ -154,6 +154,10 @@ impl Replica {
         Ok(())
     }
 
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -263,7 +267,6 @@ impl Replica {
 
         // The snaphshot is for the current epoch
         let snapshot_epoch = self.epoch;
-        debug!(snapshot_epoch, "Created snapshot");
         self.snapshot_epoch = snapshot_epoch;
 
         // We are going to upload the snapshot in the background to avoid blocking the leader
@@ -278,7 +281,7 @@ impl Replica {
             {
                 error!(?e, "Failed to upload snapshot for epoch {}", snapshot_epoch);
             } else {
-                trace!(snapshot_epoch, "Snapshot uploaded");
+                debug!(snapshot_epoch, "Snapshot completed");
                 if let Err(e) =
                     Self::override_marker(&object_store, Self::LAST_SNAPSHOT_PATH, snapshot_epoch)
                         .await
@@ -291,7 +294,7 @@ impl Replica {
         Ok(())
     }
 
-    pub async fn vacuum(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
+    pub async fn schedule_vacuum(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
         let first_epoch_to_vacuum =
             Self::read_marker(&self.object_store, Self::LAST_VACUUM_PATH).await?;
         let mut last_epoch_to_vacuum = self.epoch.saturating_sub(
@@ -303,7 +306,6 @@ impl Replica {
             last_epoch_to_vacuum = self.snapshot_epoch;
         }
 
-        debug!(first_epoch_to_vacuum, last_epoch_to_vacuum, "Vacuum");
         let objects_to_delete = stream::unfold(first_epoch_to_vacuum, move |epoch| async move {
             if epoch < last_epoch_to_vacuum {
                 if let Some(next_epoch) = epoch.checked_add(1) {
@@ -342,6 +344,7 @@ impl Replica {
                 error!(?err, "Vacuum failed");
                 let _ = tx.send(Err(err.into()));
             } else {
+                debug!("Vacuum completed");
                 let _ = tx.send(Ok(()));
                 if let Err(e) = Self::override_marker(
                     &object_store,
@@ -354,6 +357,11 @@ impl Replica {
                 }
             }
         });
+
+        debug!(
+            first_epoch_to_vacuum,
+            last_epoch_to_vacuum, "Vacuum scheduled"
+        );
 
         Ok(rx)
     }
@@ -812,7 +820,7 @@ mod tests {
             Config {
                 epoch_interval: Duration::from_secs(1),
                 snapshot_interval: Duration::from_secs(10),
-                retention_period: Duration::from_secs(10),
+                retention_period: Duration::from_secs(5),
                 ..Default::default()
             },
         )
@@ -844,13 +852,13 @@ mod tests {
             .await?;
 
         // for example we could start over from 0 and applies subsequent WALs
-        for epoch in 0..=20 {
+        for epoch in 0..=29 {
             tmp.object_store
                 .get(&Path::from(Replica::wal_path(epoch)))
                 .await?;
         }
 
-        // but now we vacuum
+        // now we vacuum
         assert_eq!(
             b"00000000000000000000",
             tmp.object_store
@@ -861,12 +869,12 @@ mod tests {
                 .as_ref()
         );
 
-        let vacuum = replica.vacuum().await?;
+        let vacuum = replica.schedule_vacuum().await?;
 
         // vacuum are run in the background, let's wait for it
         vacuum.await??;
 
-        // because we have a 10 seconds retention period we will only keep the last snapshot
+        // we have a 5 seconds retention period but we always keep the last snapshot
         assert!(tmp
             .object_store
             .get(&Path::from(Replica::snapshot_path(10)))
@@ -885,7 +893,7 @@ mod tests {
                 .is_err());
         }
 
-        // recent WALs are still there
+        // WALs on top of the snapshot are still there
         for epoch in 20..=29 {
             assert!(tmp
                 .object_store
@@ -903,6 +911,45 @@ mod tests {
                 .await?
                 .as_ref()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vacuum_edge_case() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+
+        // init the replica
+        Replica::init("lol".to_string(), &tmp.object_store).await?;
+
+        // and now let's open it
+        let mut replica = Replica::open(
+            "lol",
+            &tmp.object_store,
+            Config {
+                epoch_interval: Duration::from_secs(1),
+                snapshot_interval: Duration::from_secs(10),
+                retention_period: Duration::from_secs(10),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // and vacuum
+        replica.schedule_vacuum().await?.await??;
+
+        // We can still open the replica
+        Replica::open(
+            "lol",
+            &tmp.object_store,
+            Config {
+                epoch_interval: Duration::from_secs(1),
+                snapshot_interval: Duration::from_secs(10),
+                retention_period: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .await?;
 
         Ok(())
     }

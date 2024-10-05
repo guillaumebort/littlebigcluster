@@ -19,7 +19,7 @@ chrono = { version = "0.4.26", features = ["serde"] }
 futures = "0.3.17"
 tracing = "0.1"
 bytes = "1.1.0"
-axum = { version = "0.7", features = ["http2", "macros"] }
+axum = { version = "0.7.7", features = ["http2", "macros"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 hyper = { version = "1.4", features = ["http2", "client"] }
 hyper-util = "0.1.8"
@@ -35,3 +35,4 @@ clap = { version = "4.3.21", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["ansi"] }
 ascii_table = { version = "4.0.4", features = ["color_codes"] }
 colored = "2.1.0"
+test-log = { version = "0.2", features = ["trace"] }

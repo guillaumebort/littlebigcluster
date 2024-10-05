@@ -3,6 +3,9 @@
     "--show-output",
     "--nocapture"
   ],
+  "rust-analyzer.runnables.extraEnv": {
+    "RUST_LOG": "info,littlebigcluster=debug"
+  },
   "rust-analyzer.rustfmt.extraArgs": [
     "+nightly"
   ],
@@ -10,5 +13,5 @@
   "errorLens.messageTemplate": "",
   "errorLens.enabledDiagnosticLevels": [
     "error",
-  ],
+  ]
 }

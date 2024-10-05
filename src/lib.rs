@@ -1,4 +1,3 @@
-mod config;
 mod db;
 mod follower;
 mod gossip;
@@ -12,7 +11,6 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use axum::Router;
-pub use config::Config;
 pub use follower::Follower;
 use follower::{ClusterState, FollowerNode};
 pub use gossip::{Member, Members, Node};
@@ -24,7 +22,7 @@ use replica::Replica;
 pub struct LittleBigCluster {
     cluster_id: String,
     object_store: Arc<dyn ObjectStore>,
-    config: config::Config,
+    config: Config,
 }
 
 impl LittleBigCluster {
@@ -105,5 +103,38 @@ impl LittleBigCluster {
     pub async fn init(&self) -> Result<()> {
         Replica::init(self.cluster_id.clone(), &self.object_store).await?;
         Ok(())
+    }
+}
+
+// -- Config
+
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub epoch_interval: Duration,
+    pub snapshot_interval: Duration,
+    pub session_timeout: Duration,
+    pub retention_period: Duration,
+}
+
+impl Config {
+    pub fn snapshot_interval_epochs(&self) -> u64 {
+        self.snapshot_interval.as_secs() / self.epoch_interval.as_secs()
+    }
+
+    pub fn client_retry_timeout(&self) -> Duration {
+        self.epoch_interval * 2
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            epoch_interval: Duration::from_secs(1),
+            snapshot_interval: Duration::from_secs(30),
+            session_timeout: Duration::from_secs(20),
+            retention_period: Duration::from_secs(60 * 60 * 24 * 7),
+        }
     }
 }

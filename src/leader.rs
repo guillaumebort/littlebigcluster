@@ -24,18 +24,18 @@ use tokio::{
     select,
     sync::{futures::Notified, watch, Notify, RwLock},
     task::JoinSet,
+    time::MissedTickBehavior,
 };
 use tracing::{debug, error, trace};
 
 use crate::{
-    config::Config,
     db::{Ack, DB},
     follower::ClusterState,
     gossip::{Gossip, Member, Members, Membership},
     http2_server::{JsonResponse, Server},
     leader_client::LeaderClient,
     replica::Replica,
-    Node,
+    Config, Node,
 };
 
 #[derive(Debug)]
@@ -266,7 +266,7 @@ impl LeaderNode {
                 .route("/status", get(status))
                 .route("/gossip", post(gossip));
             let router = Router::new()
-                .nest("/_lbc", system_router)
+                .nest("/.lbc", system_router)
                 .merge(router)
                 .with_state(state.clone());
             router.layer(middleware::from_fn_with_state(state.clone(), leader_only))
@@ -415,35 +415,44 @@ impl LeaderNode {
         replica: Arc<RwLock<Replica>>,
         config: Config,
     ) -> Result<()> {
-        let vacuum_every = Duration::from_secs(5 * 60).min(config.retention_period);
-        let mut vacuum_deadline = Instant::now();
+        let mut epochs = tokio::time::interval_at(
+            (Instant::now() + config.epoch_interval).into(),
+            config.epoch_interval,
+        );
+        epochs.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        let mut vacuums =
+            tokio::time::interval(Duration::from_secs(5 * 60).min(config.retention_period));
+
         loop {
-            tokio::time::sleep(config.epoch_interval).await;
+            select! {
+                _ = epochs.tick() => {
+                    match replica.write().await.incr_epoch().await {
+                        Ok(epoch) => {
+                            trace!(epoch, "Replica epoch incremented");
 
-            match replica.write().await.incr_epoch().await {
-                Ok(epoch) => {
-                    trace!(epoch, "Replica epoch incremented");
-
-                    // Notify the epoch change
-                    epoch_updates.send_if_modified(|state| {
-                        if epoch != *state {
-                            *state = epoch;
-                            true
-                        } else {
-                            false
+                            // Notify the epoch change
+                            epoch_updates.send_if_modified(|state| {
+                                if epoch != *state {
+                                    *state = epoch;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
                         }
-                    });
-                }
-                Err(err) => {
-                    error!(?err, "Cannot increment epoch, leader fenced? Giving up");
-                    break;
-                }
-            }
+                        Err(err) => {
+                            error!(?err, "Cannot increment epoch, leader fenced? Giving up");
+                            break;
+                        }
+                    }
 
-            if Instant::now() > vacuum_deadline {
-                vacuum_deadline = Instant::now() + vacuum_every;
-                if let Err(err) = replica.write().await.vacuum().await {
-                    error!(?err, "Failed to schedule vacuum");
+                }
+
+                _ = vacuums.tick() => {
+                    if let Err(err) = replica.write().await.schedule_vacuum().await {
+                        error!(?err, "Failed to schedule vacuum");
+                    }
                 }
             }
         }
@@ -610,6 +619,7 @@ async fn leader_only(State(state): State<LeaderState>, request: Request, next: N
 async fn status(State(state): State<LeaderState>) -> JsonResponse<Value> {
     let replica = state.inner.replica.read().await;
     Ok(Json(json!({
+        "cluster_id": replica.cluster_id(),
         "this": state.this(),
         "roles": state.roles(),
         "leader": replica.leader().await?,

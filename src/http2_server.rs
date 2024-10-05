@@ -44,6 +44,7 @@ impl Server {
         let (notify_shutdown, on_shutdow) = tokio::sync::oneshot::channel();
         let serve = tokio::spawn(
             axum::serve(listener, router)
+                .tcp_nodelay(true)
                 .with_graceful_shutdown(on_shutdow.map(|_| ()))
                 .into_future(),
         );

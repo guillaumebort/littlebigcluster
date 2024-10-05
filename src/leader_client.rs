@@ -77,7 +77,7 @@ impl LeaderClient {
             let res: Result<Gossip> = http2_client
                 .json_request(
                     Method::POST,
-                    "/_lbc/gossip",
+                    "/.lbc/gossip",
                     &Gossip::Alive {
                         member: Member {
                             node: this.node,
@@ -130,7 +130,7 @@ impl LeaderClient {
             .http2_client
             .json_request::<_, _, Gossip>(
                 Method::POST,
-                "/_lbc/gossip",
+                "/.lbc/gossip",
                 &Gossip::Dead { node: self.node },
                 Duration::ZERO,
             )

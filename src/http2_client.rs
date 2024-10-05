@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Debug,
     sync::{atomic::AtomicUsize, Arc, Weak},
     time::Duration,
 };
@@ -59,6 +60,7 @@ impl Http2Client {
             };
             connections.push(connection);
         }
+        debug!(?connections, "initial http2 connections");
         let connections = Arc::new(RwLock::new(connections));
 
         let connections_change = Arc::new(Notify::new());
@@ -84,7 +86,11 @@ impl Http2Client {
     ) {
         while let Some(connections) = connections.upgrade() {
             select! {
-                _ = to.changed() => {}
+                maybe_err = to.changed() => {
+                    if maybe_err.is_err() {
+                        break;
+                    }
+                }
                 _ = tokio::time::sleep(Http2Connection::KEEP_ALIVE) => {}
             }
 
@@ -154,7 +160,7 @@ impl Http2Client {
                     Ok(res) => return Ok(res),
                     Err((err, Some(old_req))) => {
                         req = Some(old_req);
-                        error!(?err, "request failed, retrying");
+                        debug!(?err, "request failed, retrying");
                         if let Err(_) = tokio::time::timeout_at(
                             retry_deadline,
                             tokio::time::sleep(exponential_backoff),
@@ -221,22 +227,42 @@ impl Http2Client {
             if connections.is_empty() {
                 None
             } else {
-                connections
+                let x = connections
                     .get(round_robin % connections.len())
-                    .filter(|connection| !connection.is_closed())
+                    .filter(|connection| !connection.is_closed());
+                debug!(client = ?self.name, ?x, "selected connection");
+                x
             }
         })
         .ok()
     }
+
+    #[cfg(test)]
+    fn close_to(&self, node: &Node) {
+        let connections = self.connections.read();
+        for connection in connections.iter() {
+            if connection.node == *node {
+                connection.close();
+            }
+        }
+    }
 }
 
-#[derive(Debug)]
 struct Http2Connection {
     node: Node,
     sender: Mutex<SendRequest<Body>>,
     is_closed: CancellationToken,
     #[allow(unused)]
     close: DropGuard,
+}
+
+impl Debug for Http2Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http2Connection")
+            .field("node", &self.node)
+            .field("is_closed", &self.is_closed.is_cancelled())
+            .finish()
+    }
 }
 
 impl Http2Connection {
@@ -321,5 +347,212 @@ impl Http2Connection {
             })
             .boxed()
         }
+    }
+
+    pub fn close(&self) {
+        self.is_closed.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{extract::State, routing::get, Json};
+    use tracing::info;
+
+    use super::*;
+
+    struct Server {
+        node: Node,
+        requests_count: Arc<AtomicUsize>,
+        #[allow(unused)]
+        shutdown: DropGuard,
+    }
+
+    impl Server {
+        fn count_requests(&self) -> usize {
+            self.requests_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    async fn start_server(name: &str) -> Result<Server> {
+        let server = name.to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let node = Node::new("az".to_owned(), listener.local_addr()?);
+        info!(?server, ?node, "server started");
+        let cancel = CancellationToken::new();
+        let shutdown = cancel.clone().drop_guard();
+        let requests_count = Arc::new(AtomicUsize::new(0));
+        let state = (requests_count.clone(), server.clone());
+        tokio::spawn(async move {
+            async fn yo(
+                State((requests_count, server)): State<(Arc<AtomicUsize>, String)>,
+                Json(payload): Json<String>,
+            ) -> impl IntoResponse {
+                requests_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug!(?server, payload, "yo");
+                Json("yo")
+            }
+
+            let router = axum::Router::new().route("/yo", get(yo)).with_state(state);
+
+            select! {
+                _ = cancel.cancelled() => {}
+                _ = axum::serve(listener, router) => {}
+            }
+
+            // take care: at this point the server won't accept new connections but won't close the existing ones
+            info!(?server, "server stopped");
+        });
+        Ok(Server {
+            node,
+            requests_count,
+            shutdown,
+        })
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn connect_client() -> Result<()> {
+        // we have a server somewhere
+        let server = start_server("server").await?;
+
+        // we keep track of the nodes
+        let (_, nodes) = watch::channel(vec![server.node.clone()]);
+
+        // let's connect to the server
+        let client = Http2Client::open("test", nodes).await;
+
+        debug!("client connected");
+
+        // we can send a request
+        let res: String = client
+            .json_request(Method::GET, "/yo", &"1", Duration::ZERO)
+            .await?;
+        assert_eq!(res, "yo");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn no_server() -> Result<()> {
+        // we keep track of the nodes
+        let (_, nodes) = watch::channel(vec![]);
+
+        // let's connect to the server
+        let client = Http2Client::open("test", nodes).await;
+
+        // we can send a request
+        let res: Result<String> = client
+            .json_request(Method::GET, "/yo", &"1", Duration::ZERO)
+            .await;
+
+        // because we specified a retry timeout of 0, we should get an error
+        assert!(res.is_err());
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn server_joining_late() -> Result<()> {
+        // we keep track of the nodes
+        let (update_nodes, nodes) = watch::channel(vec![]);
+
+        // let's connect to the server
+        let client = Http2Client::open("test", nodes).await;
+
+        // we can send a request
+        let mut res = client
+            .json_request::<_, _, String>(Method::GET, "/yo", &"1", Duration::from_secs(30))
+            .boxed();
+
+        // for now the client is still waiting for a connection
+        assert!((&mut res).now_or_never().is_none());
+
+        // but let's add a server
+        let server = start_server("server").await?;
+
+        // and update the nodes
+        update_nodes.send(vec![server.node.clone()])?;
+
+        // so the request will eventually succeed
+        assert_eq!(res.await?, "yo");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn replace_server() -> Result<()> {
+        // let's have 2 servers
+        let server1 = start_server("server1").await?;
+        let server2 = start_server("server2").await?;
+
+        let (update_nodes, nodes) = watch::channel(vec![]);
+
+        // the client only knows about the first server
+        update_nodes.send(vec![server1.node.clone()])?;
+        let client = Http2Client::open("test", nodes).await;
+
+        // we can send a request
+        let res: String = client
+            .json_request(Method::GET, "/yo", &"1", Duration::from_secs(30))
+            .await?;
+        assert_eq!(res, "yo");
+        assert_eq!(1, server1.count_requests());
+
+        // now we replace the server
+        client.close_to(&server1.node);
+        drop(server1);
+        update_nodes.send(vec![server2.node.clone()])?;
+
+        // we can send a request
+        let res: String = client
+            .json_request(Method::GET, "/yo", &"2", Duration::from_secs(30))
+            .await?;
+        assert_eq!(res, "yo");
+        assert_eq!(1, server2.count_requests());
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn round_robin() -> Result<()> {
+        // let's have 2 servers
+        let server1 = start_server("server1").await?;
+        let server2 = start_server("server2").await?;
+
+        let (update_nodes, nodes) = watch::channel(vec![]);
+
+        // the client only knows about both servers
+        update_nodes.send(vec![server1.node.clone(), server2.node.clone()])?;
+        let client = Http2Client::open("test", nodes).await;
+
+        // let's make 10 requests
+        for i in 0..10 {
+            let res: String = client
+                .json_request(Method::GET, "/yo", &i.to_string(), Duration::from_secs(30))
+                .await?;
+            assert_eq!(res, "yo");
+        }
+
+        // the requests should be distributed evenly
+        assert_eq!(5, server1.count_requests());
+        assert_eq!(5, server2.count_requests());
+
+        // remove server1
+        update_nodes.send(vec![server2.node.clone()])?;
+        client.close_to(&server1.node);
+
+        // let's make 10 more requests
+        for i in 0..10 {
+            let res: String = client
+                .json_request(Method::GET, "/yo", &i.to_string(), Duration::from_secs(30))
+                .await?;
+            assert_eq!(res, "yo");
+        }
+
+        assert_eq!(5, server1.count_requests());
+        assert_eq!(15, server2.count_requests());
+
+        Ok(())
     }
 }

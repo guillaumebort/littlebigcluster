@@ -14,13 +14,12 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error};
 
 use crate::{
-    config::Config,
     db::DB,
     gossip::{Member, Members, Membership},
     http2_server::{JsonResponse, Server},
     leader_client::LeaderClient,
     replica::Replica,
-    Node,
+    Config, Node,
 };
 
 #[derive(Debug)]
@@ -148,7 +147,7 @@ impl FollowerNode {
         let state = ClusterState::new(node.clone(), roles.clone(), replica.clone()).await;
         let system_router = Router::new().route("/status", get(status));
         let router = Router::new()
-            .nest("/_lbc", system_router)
+            .nest("/.lbc", system_router)
             .merge(router)
             .with_state(state);
         let server = Server::start(tcp_listener, router).await?;
@@ -317,6 +316,7 @@ async fn status(State(state): State<ClusterState>) -> JsonResponse<Value> {
     let replica = state.replica();
     let replica = replica.read().await;
     Ok(Json(json!({
+        "cluster_id": replica.cluster_id(),
         "this": state.this(),
         "roles": state.roles(),
         "leader": replica.leader().await?,
