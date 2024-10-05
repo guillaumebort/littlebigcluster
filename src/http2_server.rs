@@ -155,3 +155,27 @@ fn best_ip_address() -> Option<IpAddr> {
         .next()
         .map(|(_, ip_net)| ip_net.ip())
 }
+
+#[cfg(test)]
+mod tests {
+    use test_log::test;
+
+    use super::*;
+    use crate::Node;
+
+    #[test(tokio::test)]
+    async fn server_fixes_unspecified_port() -> Result<()> {
+        let mut node = Node::new("X".to_string(), "127.0.0.1:0".parse()?);
+        Server::bind(&mut node).await?;
+        assert!(node.address.port() > 0);
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn server_fixes_unspecified_ip() -> Result<()> {
+        let mut node = Node::new("X".to_string(), "0.0.0.0:0".parse()?);
+        Server::bind(&mut node).await?;
+        assert!(!node.address.ip().is_unspecified());
+        Ok(())
+    }
+}

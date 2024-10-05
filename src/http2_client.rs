@@ -357,6 +357,7 @@ impl Http2Connection {
 #[cfg(test)]
 mod tests {
     use axum::{extract::State, routing::get, Json};
+    use test_log::test;
     use tracing::info;
 
     use super::*;
@@ -411,7 +412,7 @@ mod tests {
         })
     }
 
-    #[test_log::test(tokio::test)]
+    #[test(tokio::test)]
     async fn connect_client() -> Result<()> {
         // we have a server somewhere
         let server = start_server("server").await?;
@@ -433,7 +434,7 @@ mod tests {
         Ok(())
     }
 
-    #[test_log::test(tokio::test)]
+    #[test(tokio::test)]
     async fn no_server() -> Result<()> {
         // we keep track of the nodes
         let (_, nodes) = watch::channel(vec![]);
@@ -452,7 +453,7 @@ mod tests {
         Ok(())
     }
 
-    #[test_log::test(tokio::test)]
+    #[test(tokio::test)]
     async fn server_joining_late() -> Result<()> {
         // we keep track of the nodes
         let (update_nodes, nodes) = watch::channel(vec![]);
@@ -480,7 +481,7 @@ mod tests {
         Ok(())
     }
 
-    #[test_log::test(tokio::test)]
+    #[test(tokio::test)]
     async fn replace_server() -> Result<()> {
         // let's have 2 servers
         let server1 = start_server("server1").await?;
@@ -514,7 +515,7 @@ mod tests {
         Ok(())
     }
 
-    #[test_log::test(tokio::test)]
+    #[test(tokio::test)]
     async fn round_robin() -> Result<()> {
         // let's have 2 servers
         let server1 = start_server("server1").await?;
