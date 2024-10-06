@@ -12,6 +12,7 @@ use axum::{
     http::{HeaderName, HeaderValue, Uri},
     response::{IntoResponse, Response},
 };
+use flagset::{flags, FlagSet};
 use futures::{
     future::{self, BoxFuture},
     FutureExt,
@@ -35,6 +36,12 @@ use tracing::{debug, error, trace};
 
 use crate::Node;
 
+flags! {
+    pub enum Options: u16 {
+        SameAz,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Http2Client {
     name: String,
@@ -54,8 +61,10 @@ impl Http2Client {
         name: impl Into<String>,
         from: Node,
         mut to: watch::Receiver<Vec<Node>>,
+        options: impl Into<FlagSet<Options>>,
     ) -> Result<Self> {
         let name = name.into();
+        let options = options.into();
         let round_robin_counter = Arc::new(AtomicUsize::new(0));
 
         let mut connections = vec![];
@@ -75,9 +84,11 @@ impl Http2Client {
         let connections_change = Arc::new(Notify::new());
         tokio::spawn(Self::reconnect_in_background(
             name.clone(),
+            from.az,
             to,
             Arc::downgrade(&connections),
             connections_change.clone(),
+            options,
         ));
 
         let from = HeaderValue::from_str(&from.uuid.to_string())?;
@@ -93,9 +104,11 @@ impl Http2Client {
 
     async fn reconnect_in_background(
         client: String,
+        from_az: String,
         mut to: watch::Receiver<Vec<Node>>,
         connections: Weak<RwLock<Vec<Http2Connection>>>,
         connections_change: Arc<Notify>,
+        options: FlagSet<Options>,
     ) {
         while let Some(connections) = connections.upgrade() {
             select! {
@@ -116,6 +129,11 @@ impl Http2Client {
                 }
                 let mut to_reconnect = Vec::new();
                 for node in to.borrow_and_update().iter() {
+                    // AZ affinity
+                    if options.contains(Options::SameAz) && node.az != from_az {
+                        continue;
+                    }
+
                     if let Some(existing_connection) = connections_by_node_uuid.remove(&node.uuid) {
                         if existing_connection.is_closed() {
                             to_reconnect.push(node.clone());
@@ -130,6 +148,7 @@ impl Http2Client {
                     changed = true;
                     drop(connections_by_node_uuid); // remaining connections to old nodes
                 }
+
                 to_reconnect // new nodes or closed connections to existing nodes
             };
 
@@ -461,8 +480,13 @@ mod tests {
         let (_, nodes) = watch::channel(vec![server.node.clone()]);
 
         // let's connect to the server
-        let client =
-            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
+        let client = Http2Client::open(
+            "test",
+            Node::new("X", "127.0.0.1:8000".parse()?),
+            nodes,
+            None,
+        )
+        .await?;
 
         debug!("client connected");
 
@@ -479,8 +503,13 @@ mod tests {
         let (_, nodes) = watch::channel(vec![]);
 
         // let's connect to the server
-        let client =
-            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
+        let client = Http2Client::open(
+            "test",
+            Node::new("X", "127.0.0.1:8000".parse()?),
+            nodes,
+            None,
+        )
+        .await?;
 
         // we can send a request
         let res: Result<String> = client
@@ -499,8 +528,13 @@ mod tests {
         let (update_nodes, nodes) = watch::channel(vec![]);
 
         // let's connect to the server
-        let client =
-            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
+        let client = Http2Client::open(
+            "test",
+            Node::new("X", "127.0.0.1:8000".parse()?),
+            nodes,
+            None,
+        )
+        .await?;
 
         // we can send a request
         let mut res = client
@@ -532,8 +566,13 @@ mod tests {
 
         // the client only knows about the first server
         update_nodes.send(vec![server1.node.clone()])?;
-        let client =
-            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
+        let client = Http2Client::open(
+            "test",
+            Node::new("X", "127.0.0.1:8000".parse()?),
+            nodes,
+            None,
+        )
+        .await?;
 
         // we can send a request
         let res: String = client.json_request(Method::GET, "/yo", &"1").await?;
@@ -563,8 +602,13 @@ mod tests {
 
         // the client only knows about both servers
         update_nodes.send(vec![server1.node.clone(), server2.node.clone()])?;
-        let client =
-            Http2Client::open("test", Node::new("X", "127.0.0.1:8000".parse()?), nodes).await?;
+        let client = Http2Client::open(
+            "test",
+            Node::new("X", "127.0.0.1:8000".parse()?),
+            nodes,
+            None,
+        )
+        .await?;
 
         // let's make 10 requests
         for i in 0..10 {

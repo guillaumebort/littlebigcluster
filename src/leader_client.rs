@@ -55,7 +55,7 @@ impl LeaderClient {
             }
         });
         let http2_client =
-            Http2Client::open("leader_client", membership.this().node.clone(), rx).await?;
+            Http2Client::open("leader_client", membership.this().node.clone(), rx, None).await?;
 
         // will run the gossip protocol
         let node = membership.this().node.clone();

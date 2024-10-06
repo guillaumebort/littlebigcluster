@@ -240,6 +240,19 @@ impl DB {
         Ok(connections)
     }
 
+    async fn run_or_die<A>(f: impl Future<Output = Result<A>> + Send + 'static) -> A
+    where
+        A: Send + 'static,
+    {
+        match tokio::spawn(f).await.map_err(|e| e.into()).and_then(|r| r) {
+            Ok(a) => a,
+            Err(err) => {
+                error!(?err, "the DB may be corrupted");
+                panic!("the DB may be corrupted");
+            }
+        }
+    }
+
     async fn do_checkpoint<A>(
         &self,
         f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
@@ -264,8 +277,7 @@ impl DB {
         let wal_path = self.wal_path().to_owned();
         let shm_path = self.shm_path().to_owned();
 
-        // we fork here because we want this future to execute entirely
-        let result = tokio::spawn(async move {
+        Ok(Self::run_or_die(async move {
             // flush pending writes to the wal
             connection.execute("COMMIT;").await?;
 
@@ -299,17 +311,9 @@ impl DB {
             // start a new transaction
             connection.execute("BEGIN;").await?;
 
-            anyhow::Ok(result)
+            Ok((result, prev_pending_acks))
         })
-        .await?;
-
-        match result {
-            Ok(result) => Ok((result, prev_pending_acks)),
-            Err(err) => {
-                error!(?err, "failed to checkpoint, the DB may be corrupted");
-                panic!("corrupted state");
-            }
-        }
+        .await)
     }
 
     async fn rollback(&self) -> Result<()> {
@@ -326,8 +330,7 @@ impl DB {
 
             let mut connection = OwnedMutexGuard::map(write_conn, |(c, _)| c);
 
-            // we fork here because we want this future to execute entirely
-            let result = tokio::spawn(async move {
+            Self::run_or_die(async move {
                 // rollback the current transaction
                 connection.execute("ROLLBACK;").await?;
 
@@ -341,12 +344,7 @@ impl DB {
 
                 anyhow::Ok(())
             })
-            .await?;
-
-            if let Err(err) = result {
-                error!(?err, "failed to rollback, the DB may be corrupted");
-                panic!("corrupted state");
-            }
+            .await;
         }
         // Reject all pending acks
         tokio::task::spawn_blocking(move || {
@@ -367,8 +365,7 @@ impl DB {
         let db_snapshot = db_snapshot.into();
         let db_path = self.db_path.clone();
 
-        // we fork here because we want this future to execute entirely
-        let result = tokio::spawn(async move {
+        Self::run_or_die(async move {
             // truncate wal file
             connection.execute("COMMIT;").await?;
             connection
@@ -381,14 +378,9 @@ impl DB {
 
             anyhow::Ok(())
         })
-        .await?;
+        .await;
 
-        if let Err(err) = result {
-            error!(?err, "failed to snapshot, the DB may be corrupted");
-            panic!("corrupted state");
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     pub async fn apply_wal(&self, wal_snapshot: impl Into<PathBuf>) -> Result<()> {
@@ -404,8 +396,7 @@ impl DB {
         let wal_path = self.wal_path().to_owned();
         let shm_path = self.shm_path().to_owned();
 
-        // we fork here because we want this future to execute entirely
-        let result = tokio::spawn(async move {
+        Self::run_or_die(async move {
             // truncate wal file
             connection.execute("COMMIT;").await?;
             connection
@@ -430,14 +421,9 @@ impl DB {
 
             anyhow::Ok(())
         })
-        .await?;
+        .await;
 
-        if let Err(err) = result {
-            error!(?err, "failed to apply wal, the DB may be corrupted");
-            panic!("corrupted state");
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     fn invalidate_shm(shm_path: &Path) -> Result<()> {
@@ -467,14 +453,14 @@ impl DB {
         A: Send + Unpin + 'static,
     {
         let (ref mut conn, ref mut pending_acks) = *self.write_conn.lock().await;
-        conn.execute("SAVEPOINT _lbc_tx;").await?;
+        conn.execute("SAVEPOINT lbc_tx;").await?;
         let result = match thunk(conn).await {
             Ok(result) => {
-                conn.execute("RELEASE SAVEPOINT _lbc_tx").await?;
+                conn.execute("RELEASE SAVEPOINT lbc_tx").await?;
                 Some(result)
             }
             Err(e) => {
-                conn.execute("ROLLBACK TO SAVEPOINT _lbc_tx").await?;
+                conn.execute("ROLLBACK TO SAVEPOINT lbc_tx").await?;
                 bail!(e)
             }
         };

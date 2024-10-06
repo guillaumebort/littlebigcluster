@@ -57,6 +57,10 @@ impl Members {
         members.sort_by_key(|member| member.node.uuid);
         members
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Member> {
+        self.members.iter()
+    }
 }
 
 #[derive(Debug)]

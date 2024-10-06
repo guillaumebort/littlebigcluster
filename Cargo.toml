@@ -28,6 +28,7 @@ itertools = "0.13"
 parking_lot = "0.12"
 either = "1.13"
 socket2 = "0.5"
+flagset = "0.4.6"
 
 [dev-dependencies]
 rand = "0.8.5"

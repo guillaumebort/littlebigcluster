@@ -1,8 +1,10 @@
-use std::{future::Future, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, future::Future, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use axum::{debug_handler, extract::State, routing::get, Json, Router};
+use flagset::FlagSet;
 use futures::future::BoxFuture;
+use itertools::Itertools;
 use object_store::ObjectStore;
 use serde_json::{json, Value};
 use sqlx::{Executor, Sqlite, SqlitePool};
@@ -16,11 +18,12 @@ use tracing::{debug, error};
 use crate::{
     db::DB,
     gossip::{Member, Members, Membership},
+    http2_client,
     http2_server::{JsonResponse, Server},
     leader::STATUS_URL,
     leader_client::LeaderClient,
     replica::Replica,
-    Config, Node,
+    Config, Http2Client, Node,
 };
 
 #[derive(Debug)]
@@ -80,6 +83,9 @@ pub trait Follower {
 
     fn watch_members(&self) -> &watch::Receiver<Members>;
 
+    fn watch_members_with_roles(&self, roles: Vec<impl Into<String>>)
+        -> watch::Receiver<Vec<Node>>;
+
     fn watch_epoch(&self) -> &watch::Receiver<u64>;
 
     fn read(&self) -> impl Executor<Database = Sqlite>;
@@ -87,6 +93,12 @@ pub trait Follower {
     fn leader(&self) -> watch::Ref<'_, Option<Node>>;
 
     fn leader_client(&self) -> &LeaderClient;
+
+    fn connect_to_role(
+        &self,
+        roles: Vec<impl Into<String>>,
+        options: impl Into<FlagSet<http2_client::Options>>,
+    ) -> impl Future<Output = Result<Http2Client>>;
 
     fn address(&self) -> SocketAddr;
 
@@ -256,6 +268,39 @@ impl Follower for FollowerNode {
         self.membership.watch()
     }
 
+    fn watch_members_with_roles(
+        &self,
+        roles: Vec<impl Into<String>>,
+    ) -> watch::Receiver<Vec<Node>> {
+        let mut watch_members = self.watch_members().clone();
+        let roles = roles
+            .into_iter()
+            .map(|r| r.into())
+            .collect::<HashSet<String>>();
+        let filter_members = move |members: &Members| {
+            members
+                .iter()
+                .filter(|m| m.roles.iter().any(|r| roles.contains(r)))
+                .map(|m| m.node.clone())
+                .collect::<Vec<_>>()
+        };
+        let (update_members_with_roles, members_with_roles) =
+            watch::channel(filter_members(&*watch_members.borrow_and_update()));
+        tokio::spawn(async move {
+            while !update_members_with_roles.is_closed() {
+                if let Err(_) = watch_members.changed().await {
+                    break;
+                }
+                if let Err(_) =
+                    update_members_with_roles.send(filter_members(&*watch_members.borrow()))
+                {
+                    break;
+                }
+            }
+        });
+        members_with_roles
+    }
+
     fn leader(&self) -> watch::Ref<'_, Option<Node>> {
         self.watch_leader_node.borrow()
     }
@@ -292,6 +337,23 @@ impl Follower for FollowerNode {
 
     fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object_store
+    }
+
+    async fn connect_to_role(
+        &self,
+        roles: Vec<impl Into<String>>,
+        options: impl Into<FlagSet<http2_client::Options>>,
+    ) -> Result<Http2Client> {
+        let roles = roles.into_iter().map(|r| r.into()).collect::<Vec<_>>();
+        let client_name = format!("Client to {:?}", roles.iter().join(", "));
+        let members_with_roles = self.watch_members_with_roles(roles);
+        Http2Client::open(
+            client_name,
+            self.node().clone(),
+            members_with_roles,
+            options,
+        )
+        .await
     }
 
     async fn watch<A, F>(&self, f: F) -> Result<watch::Receiver<A>>
