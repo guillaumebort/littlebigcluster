@@ -4,37 +4,37 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.40.0", features = ["full", "test-util"] }
-tokio-util = "0.7.11"
-object_store = "0.11.0"
-anyhow = "1.0.44"
-async-channel = "1.9"
+tokio = { version = "1.40", features = ["full", "test-util"] }
+tokio-util = "0.7"
+object_store = "0.11"
+anyhow = "1.0"
+async-channel = "2.3"
 fallible-iterator = "0.3.0"
-tempfile = "3.7.1"
-num_cpus = "1.16.0"
-uuid = { version = "1.4.1", features = ["v7", "serde"] }
+tempfile = "3.13"
+num_cpus = "1.16"
+uuid = { version = "1.10", features = ["v7", "serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = { version = "0.4.26", features = ["serde"] }
-futures = "0.3.17"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
 tracing = "0.1"
-bytes = "1.1.0"
-axum = { version = "0.7.7", features = ["http2", "macros"] }
+bytes = "1.7"
+axum = { version = "0.7", features = ["http2", "macros"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 hyper = { version = "1.4", features = ["http2", "client"] }
-hyper-util = "0.1.8"
+hyper-util = "0.1"
 pnet = "0.35"
 itertools = "0.13"
 parking_lot = "0.12"
 either = "1.13"
 socket2 = "0.5"
-flagset = "0.4.6"
+flagset = "0.4"
 
 [dev-dependencies]
-rand = "0.8.5"
-clap = { version = "4.3.21", features = ["derive"] }
+rand = "0.8"
+clap = { version = "4.5", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["ansi"] }
-ascii_table = { version = "4.0.4", features = ["color_codes"] }
-colored = "2.1.0"
+ascii_table = { version = "4.0", features = ["color_codes"] }
+colored = "2.1"
 test-log = { version = "0.2", features = ["trace"] }
 reqwest = "0.12"
