@@ -127,7 +127,7 @@ mod follower {
         let mut watch_members = follower.watch_members().clone();
 
         utils::info_members(
-            "Intial members",
+            "Initial members",
             follower.node(),
             &*watch_members.borrow_and_update(),
             &*watch_leader.borrow_and_update(),
@@ -191,7 +191,7 @@ mod leader {
         let mut watch_members = leader.watch_members().clone();
 
         utils::info_members(
-            "Intial members",
+            "Initial members",
             leader.node(),
             &*watch_members.borrow_and_update(),
             &*watch_leader.borrow_and_update(),
