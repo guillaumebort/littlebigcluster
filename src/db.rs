@@ -18,8 +18,11 @@ use sqlx::{
     ConnectOptions, Executor, Sqlite, SqliteConnection, SqlitePool,
 };
 use tempfile::{NamedTempFile, TempDir};
-use tokio::{runtime::Handle, sync::oneshot};
-use tracing::debug;
+use tokio::{
+    runtime::Handle,
+    sync::{oneshot, OwnedMutexGuard},
+};
+use tracing::{debug, error};
 
 type DoAck = oneshot::Sender<bool>;
 
@@ -228,6 +231,15 @@ impl DB {
         }
     }
 
+    async fn block_all_reads(pool: &SqlitePool) -> Result<Vec<PoolConnection<Sqlite>>> {
+        let pool_size = pool.size().try_into()?;
+        let mut connections = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            connections.push(pool.acquire().await?);
+        }
+        Ok(connections)
+    }
+
     async fn do_checkpoint<A>(
         &self,
         f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
@@ -236,75 +248,105 @@ impl DB {
         A: Send + 'static,
     {
         // this will block all concurrent writes
-        let (ref mut connection, ref mut pending_acks) = *self.write_conn.lock().await;
+        let mut write_conn = self.write_conn.clone().lock_owned().await;
 
-        // let's snapshot the pending acks
+        // switch the pending acks
         let mut prev_pending_acks = Vec::with_capacity(1_024);
-        std::mem::swap(&mut prev_pending_acks, pending_acks);
-
-        // flush pending writes to the wal
-        connection.execute("COMMIT;").await?;
-
-        // run user code
-        let wal_path = self.wal_path();
-        let result =
-            tokio::task::spawn_blocking(move || Handle::current().block_on(f(wal_path))).await?;
-
-        if result.is_ok() {
-            // apply the wal to the db
-            connection
-                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                .await?;
-        } else {
-            // discard the wal
-            let _guard = self.block_all_reads().await?;
-            let wal_path = self.wal_path();
-            let shm_path = self.shm_path();
-            tokio::task::spawn_blocking(move || {
-                std::fs::File::create(wal_path)?; // truncate wal file
-                Self::invalidate_shm(&shm_path)
-            })
-            .await??;
-
-            // truncate properly
-            connection
-                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                .await?;
+        {
+            let pending_acks = &mut write_conn.1;
+            std::mem::swap(&mut prev_pending_acks, pending_acks);
         }
 
-        // start a new transaction
-        connection.execute("BEGIN;").await?;
+        let mut connection = OwnedMutexGuard::map(write_conn, |(c, _)| c);
+        let pool = self.read_pool.clone();
 
-        Ok((result, prev_pending_acks))
-    }
+        // paths
+        let wal_path = self.wal_path().to_owned();
+        let shm_path = self.shm_path().to_owned();
 
-    async fn block_all_reads(&self) -> Result<Vec<PoolConnection<Sqlite>>> {
-        let pool_size = self.read_pool.size().try_into()?;
-        let mut connections = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            connections.push(self.read_pool.acquire().await?);
+        // we fork here because we want this future to execute entirely
+        let result = tokio::spawn(async move {
+            // flush pending writes to the wal
+            connection.execute("COMMIT;").await?;
+
+            // run user code
+            let user_code_path = wal_path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || Handle::current().block_on(f(user_code_path)))
+                    .await?;
+
+            if result.is_ok() {
+                // apply the wal to the db
+                connection
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .await?;
+            } else {
+                // discard the wal
+                let _guard = Self::block_all_reads(&pool).await?;
+
+                tokio::task::spawn_blocking(move || {
+                    std::fs::File::create(wal_path)?; // truncate wal file
+                    Self::invalidate_shm(&shm_path)
+                })
+                .await??;
+
+                // truncate properly
+                connection
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .await?;
+            }
+
+            // start a new transaction
+            connection.execute("BEGIN;").await?;
+
+            anyhow::Ok(result)
+        })
+        .await?;
+
+        match result {
+            Ok(result) => Ok((result, prev_pending_acks)),
+            Err(err) => {
+                error!(?err, "failed to checkpoint, the DB may be corrupted");
+                panic!("corrupted state");
+            }
         }
-        Ok(connections)
     }
 
     async fn rollback(&self) -> Result<()> {
         let mut prev_pending_acks = Vec::with_capacity(1_024);
         {
             // this will block all concurrent writes
-            let (ref mut connection, ref mut pending_acks) = *self.write_conn.lock().await;
+            let mut write_conn = self.write_conn.clone().lock_owned().await;
 
-            std::mem::swap(&mut prev_pending_acks, pending_acks);
+            // switch the pending acks
+            {
+                let pending_acks = &mut write_conn.1;
+                std::mem::swap(&mut prev_pending_acks, pending_acks);
+            }
 
-            // rollback the current transaction
-            connection.execute("ROLLBACK;").await?;
+            let mut connection = OwnedMutexGuard::map(write_conn, |(c, _)| c);
 
-            // truncate wal file (but should be empty)
-            connection
-                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                .await?;
+            // we fork here because we want this future to execute entirely
+            let result = tokio::spawn(async move {
+                // rollback the current transaction
+                connection.execute("ROLLBACK;").await?;
 
-            // start a new transaction
-            connection.execute("BEGIN;").await?;
+                // truncate wal file (but should be empty)
+                connection
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .await?;
+
+                // start a new transaction
+                connection.execute("BEGIN;").await?;
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+            if let Err(err) = result {
+                error!(?err, "failed to rollback, the DB may be corrupted");
+                panic!("corrupted state");
+            }
         }
         // Reject all pending acks
         tokio::task::spawn_blocking(move || {
@@ -318,56 +360,84 @@ impl DB {
 
     pub async fn snapshot(&self, db_snapshot: impl Into<PathBuf>) -> Result<()> {
         // this will block all concurrent writes
-        let (ref mut connection, _) = *self.write_conn.lock().await;
+        let mut connection =
+            OwnedMutexGuard::map(self.write_conn.clone().lock_owned().await, |(c, _)| c);
 
-        // truncate wal file
-        connection.execute("COMMIT;").await?;
-        connection
-            .execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            .await?;
-        connection.execute("BEGIN;").await?;
-
-        // copy the db file
-        let db_path = self.db_path.clone();
+        // paths
         let db_snapshot = db_snapshot.into();
-        tokio::task::spawn_blocking(move || std::fs::copy(db_path, db_snapshot)).await??;
+        let db_path = self.db_path.clone();
 
-        Ok(())
+        // we fork here because we want this future to execute entirely
+        let result = tokio::spawn(async move {
+            // truncate wal file
+            connection.execute("COMMIT;").await?;
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                .await?;
+            connection.execute("BEGIN;").await?;
+
+            // copy the db file
+            tokio::task::spawn_blocking(move || std::fs::copy(db_path, db_snapshot)).await??;
+
+            anyhow::Ok(())
+        })
+        .await?;
+
+        if let Err(err) = result {
+            error!(?err, "failed to snapshot, the DB may be corrupted");
+            panic!("corrupted state");
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn apply_wal(&self, wal_snapshot: impl Into<PathBuf>) -> Result<()> {
         // this will block all concurrent writes
-        let (ref mut connection, _) = *self.write_conn.lock().await;
+        let mut connection =
+            OwnedMutexGuard::map(self.write_conn.clone().lock_owned().await, |(c, _)| c);
 
         // this will block all concurrent reads
-        let _read_guard = self.block_all_reads().await?;
+        let _read_guard = Self::block_all_reads(&self.read_pool).await?;
 
-        // truncate wal file
-        connection.execute("COMMIT;").await?;
-        connection
-            .execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            .await?;
-
+        // paths
         let wal_snapshot = wal_snapshot.into();
-        let wal_path = self.wal_path();
-        let shm_path = self.shm_path();
-        tokio::task::spawn_blocking(move || {
-            // replace the wal file
-            std::fs::copy(&wal_snapshot, &wal_path)?;
+        let wal_path = self.wal_path().to_owned();
+        let shm_path = self.shm_path().to_owned();
 
-            // invalidate the shm file
-            Self::invalidate_shm(&shm_path)
+        // we fork here because we want this future to execute entirely
+        let result = tokio::spawn(async move {
+            // truncate wal file
+            connection.execute("COMMIT;").await?;
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                .await?;
+
+            tokio::task::spawn_blocking(move || {
+                // replace the wal file
+                std::fs::copy(&wal_snapshot, &wal_path)?;
+
+                // invalidate the shm file
+                Self::invalidate_shm(&shm_path)
+            })
+            .await??;
+
+            // truncate wal file again
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&mut *connection)
+                .await?;
+
+            connection.execute("BEGIN;").await?;
+
+            anyhow::Ok(())
         })
-        .await??;
+        .await?;
 
-        // truncate wal file again
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *connection)
-            .await?;
-
-        connection.execute("BEGIN;").await?;
-
-        Ok(())
+        if let Err(err) = result {
+            error!(?err, "failed to apply wal, the DB may be corrupted");
+            panic!("corrupted state");
+        } else {
+            Ok(())
+        }
     }
 
     fn invalidate_shm(shm_path: &Path) -> Result<()> {
@@ -496,7 +566,7 @@ mod tests {
     async fn block_pool() -> Result<()> {
         let db = DB::open(None).await?;
 
-        let guard = db.block_all_reads().await?;
+        let guard = DB::block_all_reads(&db.read_pool).await?;
 
         // the pool is blocked, the call will timeout
         assert!(tokio::time::timeout(

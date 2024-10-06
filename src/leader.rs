@@ -80,7 +80,7 @@ impl LeaderState {
         }
     }
 
-    pub fn shutdown(&self) -> Notified {
+    pub fn wait_shutdown(&self) -> Notified {
         self.inner.graceful_shutdown.notified()
     }
 
@@ -756,6 +756,35 @@ mod tests {
 
         // ack will be eventually committed
         assert_eq!(1, ack.await?.rows_affected());
+
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn shutdown_leader() -> Result<()> {
+        let tmp = TmpObjectStore::new().await?;
+        let config = Config {
+            epoch_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        // start a leader node
+        let leader = LeaderNode::join(
+            Node::new("xx", "127.0.0.1:0".parse()?),
+            "test",
+            Router::new().route("/yo", get(|| async { "yo" })),
+            Router::new(),
+            tmp.object_store,
+            vec![],
+            config,
+        )
+        .await?;
+
+        // wait for leadership
+        leader.wait_for_leadership().await?;
+
+        // and shutdown
+        leader.shutdown().await?;
 
         Ok(())
     }
