@@ -1,11 +1,10 @@
-use std::time::Duration;
-
 use anyhow::Result;
 use chrono::Utc;
 use hyper::Method;
 use tokio::{
     sync::watch,
     task::{yield_now, JoinSet},
+    time::MissedTickBehavior,
 };
 use tracing::{debug, error};
 
@@ -24,8 +23,6 @@ pub struct LeaderClient {
 }
 
 impl LeaderClient {
-    const MAX_EXPONENTIAL_BACKOFF: Duration = Duration::from_secs(30);
-
     pub async fn new(
         membership: Membership,
         mut watch_leader: watch::Receiver<Option<Node>>,
@@ -70,7 +67,8 @@ impl LeaderClient {
 
     async fn gossip(http2_client: Http2Client, membership: Membership) {
         let mut known_members_hash = MembersHash::ZERO;
-        let mut sleep_duration = Duration::ZERO;
+        let mut gossip_ticks = tokio::time::interval(membership.gossip_interval());
+        gossip_ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             let this = membership.this();
@@ -88,14 +86,6 @@ impl LeaderClient {
                 )
                 .await;
 
-            // exponential backoff
-            sleep_duration = (if sleep_duration == Duration::ZERO {
-                Duration::from_secs(1)
-            } else {
-                sleep_duration * 2
-            })
-            .min(Self::MAX_EXPONENTIAL_BACKOFF);
-
             match res {
                 Ok(ref gossip @ Gossip::Rumors { members_hash, .. }) => {
                     membership.gossip(Utc::now(), gossip.clone());
@@ -106,7 +96,7 @@ impl LeaderClient {
                 }
             }
 
-            tokio::time::sleep(sleep_duration).await;
+            gossip_ticks.tick().await;
         }
     }
 

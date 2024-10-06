@@ -30,6 +30,7 @@ use tokio::{
     net::TcpStream,
     select,
     sync::{watch, Notify},
+    time::MissedTickBehavior,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, trace};
@@ -110,6 +111,8 @@ impl Http2Client {
         connections_change: Arc<Notify>,
         options: FlagSet<Options>,
     ) {
+        let mut ticks = tokio::time::interval(Http2Connection::KEEP_ALIVE);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         while let Some(connections) = connections.upgrade() {
             select! {
                 maybe_err = to.changed() => {
@@ -117,7 +120,7 @@ impl Http2Client {
                         break;
                     }
                 }
-                _ = tokio::time::sleep(Http2Connection::KEEP_ALIVE) => {}
+                _ = ticks.tick() => {}
             }
 
             let mut changed = false;

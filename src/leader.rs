@@ -334,6 +334,9 @@ impl LeaderNode {
         config: Config,
     ) -> Result<()> {
         debug!("Waiting for leadership...");
+        let mut epochs = tokio::time::interval(config.epoch_interval);
+        epochs.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         loop {
             let mut replica_guard = replica.write().await;
 
@@ -395,7 +398,7 @@ impl LeaderNode {
             }
             drop(replica_guard);
 
-            tokio::time::sleep(config.epoch_interval).await;
+            epochs.tick().await;
         }
     }
 
@@ -676,7 +679,7 @@ async fn gossip(
                     watch_members.wait_for(|members| known_members_hash != members.hash);
                 select! {
                     _ = members_changed => {}
-                    _ = tokio::time::sleep(state.config().session_timeout / 2) => {}
+                    _ = tokio::time::sleep(state.inner.membership.gossip_interval()) => {}
                     _ = state.inner.graceful_shutdown.notified() => {
                         state.inner.membership.gossip(Utc::now(), Gossip::Dead { node: state.this().clone() });
                     }

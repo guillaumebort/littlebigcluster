@@ -214,6 +214,8 @@ impl FollowerNode {
         config: Config,
         cancel: CancellationToken,
     ) -> Result<()> {
+        let mut epochs = tokio::time::interval(config.epoch_interval);
+        epochs.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         while !cancel.is_cancelled() {
             let mut replica = replica.write().await;
             replica.follow().await?;
@@ -244,7 +246,7 @@ impl FollowerNode {
             drop(replica);
 
             // Wait for the next epoch
-            tokio::time::sleep(config.epoch_interval).await;
+            epochs.tick().await;
         }
         Ok(())
     }

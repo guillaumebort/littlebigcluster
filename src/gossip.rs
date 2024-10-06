@@ -3,13 +3,14 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::{sync::watch, time::MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::Config;
@@ -99,8 +100,10 @@ impl Membership {
             let state = state.clone();
             let config = config.clone();
             tokio::spawn(async move {
+                let mut ticks = tokio::time::interval(config.session_timeout / 2);
+                ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 loop {
-                    tokio::time::sleep(config.session_timeout).await;
+                    ticks.tick().await;
                     let state = state.lock();
                     if state.updates_tx.is_closed() {
                         break;
@@ -114,6 +117,10 @@ impl Membership {
             updates_rx,
             config,
         }
+    }
+
+    pub fn gossip_interval(&self) -> Duration {
+        self.config.session_timeout / 2
     }
 
     pub fn members(&self) -> watch::Ref<'_, Members> {
