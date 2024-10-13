@@ -161,6 +161,7 @@ impl DB {
     pub async fn checkpoint<A>(
         &self,
         f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
+        snapshot_to: Option<PathBuf>,
     ) -> Result<A>
     where
         A: Send + 'static,
@@ -168,13 +169,16 @@ impl DB {
         let shadow = NamedTempFile::new_in(self.tmp.path())?;
         let (result, pending_acks) = {
             let shadow = shadow.path().to_owned();
-            self.do_checkpoint(|wal| {
-                async move {
-                    tokio::fs::copy(wal, shadow).await?;
-                    Ok(())
-                }
-                .boxed()
-            })
+            self.do_checkpoint(
+                |wal| {
+                    async move {
+                        tokio::fs::copy(wal, shadow).await?;
+                        Ok(())
+                    }
+                    .boxed()
+                },
+                snapshot_to,
+            )
             .await?
         };
         result?;
@@ -207,7 +211,7 @@ impl DB {
     where
         A: Send + 'static,
     {
-        let (result, pending_acks) = self.do_checkpoint(f).await?;
+        let (result, pending_acks) = self.do_checkpoint(f, None).await?;
         match result {
             Ok(a) => {
                 tokio::task::spawn_blocking(|| {
@@ -256,6 +260,7 @@ impl DB {
     async fn do_checkpoint<A>(
         &self,
         f: impl (FnOnce(PathBuf) -> BoxFuture<'static, Result<A>>) + Send + 'static,
+        snapshot_to: Option<PathBuf>,
     ) -> Result<(Result<A>, Vec<DoAck>)>
     where
         A: Send + 'static,
@@ -277,7 +282,7 @@ impl DB {
         let wal_path = self.wal_path().to_owned();
         let shm_path = self.shm_path().to_owned();
 
-        Ok(Self::run_or_die(async move {
+        let result = Self::run_or_die(async move {
             // flush pending writes to the wal
             connection.execute("COMMIT;").await?;
 
@@ -313,7 +318,16 @@ impl DB {
 
             Ok((result, prev_pending_acks))
         })
-        .await)
+        .await;
+
+        // snapshot the db if requested
+        // (at this point the WAL file is empty)
+        if let Some(snapshot_to) = snapshot_to {
+            let db_path = self.db_path.clone();
+            tokio::task::spawn_blocking(move || std::fs::copy(db_path, snapshot_to)).await??;
+        }
+
+        Ok(result)
     }
 
     async fn rollback(&self) -> Result<()> {
@@ -353,33 +367,6 @@ impl DB {
             }
         })
         .await?;
-        Ok(())
-    }
-
-    pub async fn snapshot(&self, db_snapshot: impl Into<PathBuf>) -> Result<()> {
-        // this will block all concurrent writes
-        let mut connection =
-            OwnedMutexGuard::map(self.write_conn.clone().lock_owned().await, |(c, _)| c);
-
-        // paths
-        let db_snapshot = db_snapshot.into();
-        let db_path = self.db_path.clone();
-
-        Self::run_or_die(async move {
-            // truncate wal file
-            connection.execute("COMMIT;").await?;
-            connection
-                .execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                .await?;
-            connection.execute("BEGIN;").await?;
-
-            // copy the db file
-            tokio::task::spawn_blocking(move || std::fs::copy(db_path, db_snapshot)).await??;
-
-            anyhow::Ok(())
-        })
-        .await;
-
         Ok(())
     }
 
@@ -571,7 +558,7 @@ mod tests {
     async fn rollback_transaction_on_failure() -> Result<()> {
         let db = DB::open(None).await?;
         let _ = db.execute(sqlx::query("CREATE TABLE batchs(uuid)")).await?;
-        db.checkpoint(|_| async { Ok(()) }.boxed()).await?;
+        db.checkpoint(|_| async { Ok(()) }.boxed(), None).await?;
 
         // transaction rollback
         assert!(db
@@ -628,7 +615,8 @@ mod tests {
         // snaphot the db
         let tmp = TempDir::new()?;
         let db_snapshot = tmp.path().join("db_snapshot");
-        db.snapshot(&db_snapshot).await?;
+        db.checkpoint(|_| async { Ok(()) }.boxed(), Some(db_snapshot.to_owned()))
+            .await?;
 
         // restore the snapshot
         let db = DB::open(Some(&db_snapshot)).await?;
@@ -648,14 +636,17 @@ mod tests {
 
         // checkpoint the db
         let wal_snapshot_1 = db
-            .checkpoint(|wal| {
-                async {
-                    let tmp = NamedTempFile::new()?;
-                    std::fs::copy(wal, tmp.path())?;
-                    Ok(tmp)
-                }
-                .boxed()
-            })
+            .checkpoint(
+                |wal| {
+                    async {
+                        let tmp = NamedTempFile::new()?;
+                        std::fs::copy(wal, tmp.path())?;
+                        Ok(tmp)
+                    }
+                    .boxed()
+                },
+                None,
+            )
             .await?;
         assert!(wal_snapshot_1.path().exists());
 
@@ -677,14 +668,17 @@ mod tests {
 
         // checkpoint the db
         let wal_snapshot_2 = db
-            .checkpoint(|wal| {
-                async {
-                    let tmp = NamedTempFile::new()?;
-                    std::fs::copy(wal, tmp.path())?;
-                    Ok(tmp)
-                }
-                .boxed()
-            })
+            .checkpoint(
+                |wal| {
+                    async {
+                        let tmp = NamedTempFile::new()?;
+                        std::fs::copy(wal, tmp.path())?;
+                        Ok(tmp)
+                    }
+                    .boxed()
+                },
+                None,
+            )
             .await?;
         assert!(wal_snapshot_2.path().exists());
 
@@ -706,14 +700,17 @@ mod tests {
 
         // checkpoint the db
         let wal_snapshot_3 = db
-            .checkpoint(|wal| {
-                async {
-                    let tmp = NamedTempFile::new()?;
-                    std::fs::copy(wal, tmp.path())?;
-                    Ok(tmp)
-                }
-                .boxed()
-            })
+            .checkpoint(
+                |wal| {
+                    async {
+                        let tmp = NamedTempFile::new()?;
+                        std::fs::copy(wal, tmp.path())?;
+                        Ok(tmp)
+                    }
+                    .boxed()
+                },
+                None,
+            )
             .await?;
         assert!(wal_snapshot_3.path().exists());
         assert_eq!(1, ack_3.await?.rows_affected());
@@ -773,14 +770,17 @@ mod tests {
 
         // checkpoint the db
         let wal_snapshot_1 = db
-            .checkpoint(|wal| {
-                async {
-                    let tmp = NamedTempFile::new()?;
-                    std::fs::copy(wal, tmp.path())?;
-                    Ok(tmp)
-                }
-                .boxed()
-            })
+            .checkpoint(
+                |wal| {
+                    async {
+                        let tmp = NamedTempFile::new()?;
+                        std::fs::copy(wal, tmp.path())?;
+                        Ok(tmp)
+                    }
+                    .boxed()
+                },
+                None,
+            )
             .await?;
         assert!(wal_snapshot_1.path().exists());
 
@@ -898,7 +898,7 @@ mod tests {
                 .boxed()
             })
             .await?;
-        db.checkpoint(|_| async { Ok(()) }.boxed()).await?;
+        db.checkpoint(|_| async { Ok(()) }.boxed(), None).await?;
         ack.await?;
 
         // on the read pool we see the initial data
@@ -937,7 +937,7 @@ mod tests {
         assert_eq!(20, count);
 
         // checkpoint the db
-        db.checkpoint(|_| async { Ok(()) }.boxed()).await?;
+        db.checkpoint(|_| async { Ok(()) }.boxed(), None).await?;
         ack.await?;
 
         // now the data are visible
@@ -962,7 +962,9 @@ mod tests {
             .await?;
 
         let snapshot = log.path().join("snapshot");
-        leader.snapshot(&snapshot).await?;
+        leader
+            .checkpoint(|_| async { Ok(()) }.boxed(), Some(snapshot.clone()))
+            .await?;
         assert!(snapshot.exists());
 
         let follower = DB::open(Some(&snapshot)).await?;
@@ -1053,14 +1055,17 @@ mod tests {
                         }
                     } else {
                         match leader
-                            .checkpoint(|wal| {
-                                async {
-                                    let tmp = NamedTempFile::new().unwrap();
-                                    std::fs::copy(wal, tmp.path())?;
-                                    Ok(tmp)
-                                }
-                                .boxed()
-                            })
+                            .checkpoint(
+                                |wal| {
+                                    async {
+                                        let tmp = NamedTempFile::new().unwrap();
+                                        std::fs::copy(wal, tmp.path())?;
+                                        Ok(tmp)
+                                    }
+                                    .boxed()
+                                },
+                                None,
+                            )
                             .await
                         {
                             Ok(tmp) => {

@@ -6,14 +6,14 @@
 
 - **No Central Database Needed**: Every node has access to an in-process SQLite database. The leader has read-write access, while followers have read-only access.
 - **Automatic Leader Election**: Built-in leader election with support for standby leaders.
-- **Effortless Backups and Rollbacks**: State is safely stored in the object store, eliminating the need for backups. Rollbacks are available to any point in time within the retention period (default 7 days).
-- **Built-in HTTP/2 Communication**: Each node includes built-in HTTP/2 servers and clients. Nodes maintain an always-open connection to the current leader, mitigating high write latency with multiple in-flight streams on a single TCP connection.
+- **Effortless Backups and Rollbacks**: Cluster state is safely stored in the object store, eliminating the need for backups. Rollbacks are available to any point in time within the retention period (default 7 days).
+- **Built-in HTTP/2 Communication**: Each node includes built-in HTTP/2 servers and clients, mitigating high write latency with multiple in-flight streams on a single TCP connection. Nodes maintain an always-open connection to the current leader. You can also open connections to other nodes based on their roles.
 - **Cluster Membership Management**: Member discovery is managed using a gossip-like protocol. Each member reports its status to the leader, which then distributes the membership view to all nodes.
 - **Object Store Access**: Direct access to the object store for managing the data plane of your cluster application.
 
 ## Why?
 
-This experiment explores an idea I've always wanted to pursue: creating a clustered application without relying on a central database or coordinator (like Zookeeper or etcd). With the addition of atomic put support in S3 (since September 2024), this is now feasible. The goal is to use only an object store, which is universally available across cloud providers, on-premise (e.g., MinIO), and local development (using a POSIX filesystem). This approach offers durability, availability, and simplicity: nodes are diskless, making them easy to replace and delete.
+This experiment explores an idea I've always wanted to pursue: creating a clustered application without relying on a central database or coordinator (like Zookeeper or etcd). With the addition of atomic put support in S3 (since September 2024), this is now feasible. The goal is to use only an object store, which is universally available across cloud providers, on-premise (e.g., MinIO), and local development (using a POSIX filesystem). This approach offers durability, availability, and simplicity: all nodes in the cluster are diskless, making them easy to replace and delete.
 
 ## How it works?
 
@@ -21,15 +21,15 @@ This experiment explores an idea I've always wanted to pursue: creating a cluste
 
 2. **WAL and Snapshots**:
 
-   - The `/.lbc/` folder on the object store contains WAL files and database snapshots.
+   - The `.lbc/` folder on the object store contains WAL files and database snapshots.
    - Each epoch has a corresponding WAL file (e.g., `00000000000000000001.wal`), which contains SQLite Write-Ahead Log data.
    - Full SQLite database snapshots are stored in files like `00000000000000000020.db`.
-   - The latest snapshot epoch is tracked in the `/.lbc/.last_snapshot` file.
+   - The latest snapshot epoch is tracked in the `.lbc/.last_snapshot` file.
 
 3. **Node Join Process**:
 
-   - Nodes start as followers and read `/.lbc/.last_snapshot` to determine the latest snapshot.
-   - They make a LIST request to the object store using the latests snapshot epoch as prefix.
+   - Nodes start as followers and read `.lbc/.last_snapshot` to determine the latest snapshot.
+   - They make a LIST request to the object store using the latest known snapshot epoch as prefix.
    - They download the most recent snapshot and apply all successive WAL files to catch up to the current epoch.
 
 4. **Leader Information**: The current leader's coordinates are stored in a system table (`_lbc`) within the database.
@@ -49,7 +49,9 @@ There is a `lol_cluster` example you can start locally:
 
 First create a fake object store in your file system
 
-```mkdir -p /tmp/lol```
+```
+mkdir -p /tmp/lol
+```
 
 Then initialize the cluster:
 
@@ -115,7 +117,7 @@ You can now keep adding more followers (or standby leaders) and see how they joi
 ## Prior Art
 
 - **Litestream**: Inspired the idea of replicating a SQLite database by physically replicating WAL files, similar to the approach used here.
-- **DeltaLake**: Shares the concept of using an object store as the only dependency. The protocol here is similar, though we do not expect write conflicts under normal operations (but conflict detection follows a similar approach).
+- **DeltaLake**: Shares the concept of using an object store as the only dependency. The protocol here is similar, though we do not expect write conflicts under normal operations (_but conflict detection follows a similar approach_).
 
 ## License
 

@@ -131,24 +131,23 @@ impl Replica {
                 })
                 .await?;
 
-            // Do a first checkpoint for epoch 0 and push the WAL to the object store
-            db.checkpoint(|wal_path| {
-                async move {
-                    let wal_snapshot_path = Self::wal_path(0);
-                    Self::put_if_not_exists(&object_store, &wal_snapshot_path, &wal_path).await
+            // Do a first checkpoint/snapshot for epoch 0 and push the WAL to the object store
+            let snapshot_tmp = NamedTempFile::new()?;
+            let wal_0 = Self::wal_path(0);
+            let snapshot_0 = Self::snapshot_path(0);
+            let object_store_clone = object_store.clone();
+            db.checkpoint(
+                |wal_tmp| {
+                    async move {
+                    Self::put_if_not_exists(&object_store_clone, &wal_0, &wal_tmp).await
                 }
                 .boxed()
-            })
+                },
+                Some(snapshot_tmp.path().into()),
+            )
             .await?;
+            Self::put_if_not_exists(&object_store, &snapshot_0, &snapshot_tmp.path()).await?;
             ack.await?;
-        }
-
-        // Create the initial snapshot for epoch 0
-        {
-            let snapshost_0 = NamedTempFile::new()?;
-            db.snapshot(snapshost_0.path()).await?;
-            Self::put_if_not_exists(object_store, &Self::snapshot_path(0), snapshost_0.path())
-                .await?;
         }
 
         // Markers
@@ -217,9 +216,13 @@ impl Replica {
         let object_store = self.object_store.clone();
 
         // Snapshot if needed
-        if next_epoch - self.snapshot_epoch > self.config.snapshot_interval_epochs().try_into()? {
-            self.snapshot().await?;
-        }
+        let snapshot_tmp = if next_epoch - self.snapshot_epoch
+            >= self.config.snapshot_interval_epochs().try_into()?
+        {
+            Some(NamedTempFile::new()?)
+        } else {
+            None
+        };
 
         let _ = self
             .db
@@ -238,21 +241,52 @@ impl Replica {
 
         match self
             .db
-            .checkpoint(move |shallow_wal| {
-                async move {
-                    // TODO retry on _some_ failures (but not on conflict)
-                    Self::put_if_not_exists(
-                        &object_store,
-                        &Self::wal_path(next_epoch),
-                        &shallow_wal,
-                    )
-                    .await
-                }
-                .boxed()
-            })
+            .checkpoint(
+                move |shallow_wal| {
+                    async move {
+                        // TODO retry on _some_ failures (but not on conflict)
+                        Self::put_if_not_exists(
+                            &object_store,
+                            &Self::wal_path(next_epoch),
+                            &shallow_wal,
+                        )
+                        .await
+                    }
+                    .boxed()
+                },
+                snapshot_tmp.as_ref().map(|tmp| tmp.path().to_owned()),
+            )
             .await
         {
             Ok(()) => {
+                if let Some(snapshot_tmp) = snapshot_tmp {
+                    self.snapshot_epoch = next_epoch;
+                    // Snapshot is uploaded in the background
+                    let object_store = self.object_store.clone();
+                    self.tasks.spawn(async move {
+                        if let Err(e) = Self::put_if_not_exists(
+                            &object_store,
+                            &Self::snapshot_path(next_epoch),
+                            snapshot_tmp.path(),
+                        )
+                        .await
+                        {
+                            error!(?e, "Failed to upload snapshot for epoch {}", next_epoch);
+                        } else {
+                            debug!(next_epoch, "Snapshot completed");
+                            if let Err(e) = Self::override_marker(
+                                &object_store,
+                                Self::LAST_SNAPSHOT_PATH,
+                                next_epoch,
+                            )
+                            .await
+                            {
+                                error!(?e, "Failed to update last snapshot marker");
+                            }
+                        }
+                    });
+                }
+
                 self.epoch = next_epoch;
                 Ok(next_epoch)
             }
@@ -261,41 +295,6 @@ impl Replica {
                 Err(anyhow!("Failed to increment epoch: {}", e))
             }
         }
-    }
-
-    /// Do a snapshot of the current state of the DB and push it to the object store
-    async fn snapshot(&mut self) -> Result<()> {
-        // First create a local snapshot
-        let snapshot = NamedTempFile::new()?;
-        self.db.snapshot(snapshot.path()).await?;
-
-        // The snaphshot is for the current epoch
-        let snapshot_epoch = self.epoch;
-        self.snapshot_epoch = snapshot_epoch;
-
-        // We are going to upload the snapshot in the background to avoid blocking the leader
-        let object_store = self.object_store.clone();
-        tokio::spawn(async move {
-            if let Err(e) = Self::put_if_not_exists(
-                &object_store,
-                &Self::snapshot_path(snapshot_epoch),
-                snapshot.path(),
-            )
-            .await
-            {
-                error!(?e, "Failed to upload snapshot for epoch {}", snapshot_epoch);
-            } else {
-                debug!(snapshot_epoch, "Snapshot completed");
-                if let Err(e) =
-                    Self::override_marker(&object_store, Self::LAST_SNAPSHOT_PATH, snapshot_epoch)
-                        .await
-                {
-                    error!(?e, "Failed to update last snapshot marker");
-                }
-            }
-        });
-
-        Ok(())
     }
 
     pub async fn schedule_vacuum(&mut self) -> Result<oneshot::Receiver<Result<()>>> {
@@ -601,6 +600,7 @@ mod tests {
     use anyhow::Result;
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
+    use test_log::test;
 
     use super::*;
 
@@ -618,7 +618,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn init_replica() -> Result<()> {
         let tmp = TmpObjectStore::new().await?;
 
@@ -639,7 +639,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn already_initialized_replica() -> Result<()> {
         let tmp = TmpObjectStore::new().await?;
 
@@ -654,7 +654,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn bad_cluster_id() -> Result<()> {
         let tmp = TmpObjectStore::new().await?;
 
@@ -669,7 +669,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn leader_follower() -> Result<()> {
         let tmp = TmpObjectStore::new().await?;
 
@@ -738,7 +738,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn acquire_leadership() -> Result<()> {
         let tmp = TmpObjectStore::new().await?;
 
@@ -791,7 +791,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn zombie_leader() -> Result<()> {
         let tmp = TmpObjectStore::new().await?;
 
@@ -811,7 +811,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn snapshot_and_vacuum() -> Result<()> {
         let tmp = TmpObjectStore::new().await?;
 
@@ -832,7 +832,7 @@ mod tests {
         .await?;
 
         // let's push the epoch to 29
-        for _ in 0..30 {
+        for _ in 0..29 {
             replica.incr_epoch().await?;
         }
 
@@ -920,7 +920,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn vacuum_edge_case() -> Result<()> {
         let tmp = TmpObjectStore::new().await?;
 
