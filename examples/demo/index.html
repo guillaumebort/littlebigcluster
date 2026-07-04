@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>littlebigcluster</title>
+  </head>
+  <body>
+
+    <h1>🐣🐘 littlebigcluster demo</h1>
+
+    <h2>Cluster</h2>
+    {% if members.is_empty() %}
+    <p>no members</p>
+    {% else %}
+    <table border="1" cellpadding="4">
+      <tr>
+        <th></th>
+        <th>id</th>
+        <th>addr</th>
+        <th>az</th>
+        <th>epoch</th>
+      </tr>
+      {% for m in members %}
+      <tr{% if m.is_leader %} style="font-weight:bold"{% endif %}>
+        <td>{{ m.mark }}</td>
+        <td>{{ m.id }}{{ m.leader_suffix }}</td>
+        <td>{{ m.addr }}</td>
+        <td>{{ m.az }}</td>
+        <td>{{ m.epoch }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    <h2>Schema</h2>
+    {% if schema.is_empty() %}
+    <p>(no tables)</p>
+    {% else %}
+    <table border="1" cellpadding="4">
+      <tr>
+        <th>table</th>
+        <th>ddl</th>
+      </tr>
+      {% for t in schema %}
+      <tr>
+        <td>{{ t.name }}</td>
+        <td><pre>{{ t.ddl }}</pre></td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    <h2>SQL</h2>
+    {% if !is_leader %}
+    <p>writes require leadership (SELECT works on any node)</p>
+    {% endif %}
+    <form method="post" action="/sql">
+      <textarea name="sql" rows="4" cols="80"></textarea><br>
+      <button type="submit">Run</button>
+    </form>
+
+    {% if let Some(result) = result %}
+    <h3>Result</h3>
+    {% if let Some(error) = result.error %}
+    <pre>error: {{ error }}</pre>
+    {% else if let Some(rows) = result.write_rows %}
+    <pre>OK ({{ rows }} row(s) affected)</pre>
+    {% else %}
+    <table border="1" cellpadding="4">
+      <tr>
+        {% for col in result.query_columns %}
+        <th>{{ col }}</th>
+        {% endfor %}
+      </tr>
+      {% for row in result.query_rows %}
+      <tr>
+        {% for cell in row %}
+        <td>{{ cell }}</td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </table>
+    <p>({{ result.query_rows.len() }} row(s))</p>
+    {% endif %}
+    {% endif %}
+
+  </body>
+</html>

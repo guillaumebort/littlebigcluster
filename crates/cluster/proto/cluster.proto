@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package lbc.cluster;
+
+// Membership and liveness only — leadership and replication use the object-store
+// epoch chain in `lbc-db`, not this service.
+service Cluster {
+  rpc Membership(stream MembershipRequest) returns (stream MembershipEvent);
+}
+
+message MembershipRequest {
+  oneof request {
+    Join join = 1;
+    Heartbeat heartbeat = 2;
+  }
+}
+
+message Join {
+  string node_id = 1;
+  string addr = 2;
+  string az = 3;
+  uint64 epoch = 4;
+  repeated string capabilities = 5;
+}
+
+message Heartbeat {
+  uint64 epoch = 1;
+}
+
+message MembershipEvent {
+  repeated Member members = 1;
+}
+
+message Member {
+  string node_id = 1;
+  string addr = 2;
+  string az = 3;
+  uint64 epoch = 4;
+  repeated string capabilities = 5;
+}

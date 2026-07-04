@@ -1,0 +1,27 @@
+[package]
+name = "lbc-db"
+description = "Generic SQLite replication over an object store via logical changesets"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+object_store = { workspace = true }
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+prost = { workspace = true }
+lz4_flex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+parking_lot = "0.12"
+num_cpus = "1.16"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }

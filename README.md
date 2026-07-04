@@ -1,123 +1,90 @@
 # LittleBigCluster 🐣🐘
 
-**LittleBigCluster** is a Rust library for building cluster applications using an object store (like S3) as the only dependency. Nodes are diskless, with all state replicated in the object store. It provides a replicated SQLite database, with a leader-follower model: the leader has read-write access, and followers have read-only access. This SQLite database is ideal for managing the control plane of the cluster, the tradeoff being high write latency (~1 second with the default settings).
+**LittleBigCluster** is a Rust library for building cluster applications using an object store (like S3) as the only dependency. Nodes are diskless — all durable state lives in the object store — and each node runs an in-process SQLite database replicated from that store. The leader has read-write access; followers have read-only access. This SQLite database is ideal for managing the control plane of a cluster. The tradeoff is write latency (~1 second with the default settings), which is often acceptable for a control plane.
 
 ## What do you get?
 
-- **No Central Database Needed**: Every node has access to an in-process SQLite database. The leader has read-write access, while followers have read-only access.
-- **Automatic Leader Election**: Built-in leader election with support for standby leaders.
-- **Effortless Backups and Rollbacks**: Cluster state is safely stored in the object store, eliminating the need for backups. Rollbacks are available to any point in time within the retention period (default 7 days).
-- **Built-in HTTP/2 Communication**: Each node includes built-in HTTP/2 servers and clients, mitigating high write latency with multiple in-flight streams on a single TCP connection. Nodes maintain an always-open connection to the current leader. You can also open connections to other nodes based on their roles.
-- **Cluster Membership Management**: Member discovery is managed using a gossip-like protocol. Each member reports its status to the leader, which then distributes the membership view to all nodes.
-- **Object Store Access**: Direct access to the object store for managing the data plane of your cluster application.
+- **No central database needed**: Every node has access to an in-process SQLite database. The leader writes; followers serve consistent reads.
+- **Automatic leader election**: Built-in leader election with support for standby leaders. A follower promotes itself when the current leader stops advancing epochs.
+- **Effortless backups and rollbacks**: Cluster state is stored in the object store. Snapshots and epoch history let you recover to any point within the retention window.
+- **gRPC cluster membership**: Each node runs a membership service. Members heartbeat to the leader, which distributes the roster to all nodes.
+- **Object store as the only dependency**: Works with S3, MinIO, a local filesystem, or any backend supported by the [`object_store`](https://docs.rs/object_store) crate.
 
 ## Why?
 
-This experiment explores an idea I've always wanted to pursue: creating a clustered application without relying on a central database or coordinator (like Zookeeper or etcd). With the addition of atomic put support in S3 (since September 2024), this is now feasible. The goal is to use only an object store, which is universally available across cloud providers, on-premise (e.g., MinIO), and local development (using a POSIX filesystem). This approach offers durability, availability, and simplicity: all nodes in the cluster are diskless, making them easy to replace and delete.
+This experiment explores an idea I've always wanted to pursue: building a clustered application without relying on a central database or coordinator (like Zookeeper or etcd). With atomic put support in S3 (since September 2024), this is now feasible. The goal is to use only an object store — universally available across cloud providers, on-premise (e.g. MinIO), and local development (using a POSIX filesystem). All nodes are diskless, making them easy to replace and delete.
 
-## How it works?
+## How it works
 
-1. **Epoch Management**: The cluster starts with an epoch value of 0, which is incremented monotonically.
+1. **Epoch management**: The cluster advances a monotonic epoch counter. Each epoch is an atomic write to the object store.
 
-2. **WAL and Snapshots**:
+2. **Changesets and snapshots**:
+   - Each epoch file (`epochs/{epoch:020}`) contains a **logical changeset** captured via the SQLite session extension — not a raw WAL file.
+   - Periodic **snapshots** (`snapshots/{epoch:020}`) are full database copies produced with `VACUUM INTO`.
+   - The latest snapshot epoch is tracked in `last_snapshot`.
 
-   - The `.lbc/` folder on the object store contains WAL files and database snapshots.
-   - Each epoch has a corresponding WAL file (e.g., `00000000000000000001.wal`), which contains SQLite Write-Ahead Log data.
-   - Full SQLite database snapshots are stored in files like `00000000000000000020.db`.
-   - The latest snapshot epoch is tracked in the `.lbc/.last_snapshot` file.
+3. **Node join process**:
+   - A new node reads `last_snapshot` to find the latest snapshot, downloads it, then applies every successive epoch to catch up.
+   - It then follows new epochs as they appear.
 
-3. **Node Join Process**:
+4. **Leader information**: The current leader's identity and address are recorded in each epoch's metadata.
 
-   - Nodes start as followers and read `.lbc/.last_snapshot` to determine the latest snapshot.
-   - They make a LIST request to the object store using the latest known snapshot epoch as prefix.
-   - They download the most recent snapshot and apply all successive WAL files to catch up to the current epoch.
+5. **Following epochs**: Followers continuously fetch and apply epoch `N + 1` to stay current with the leader.
 
-4. **Leader Information**: The current leader's coordinates are stored in a system table (`_lbc`) within the database.
+6. **Leader election**:
+   - A node eligible for leadership waits until the current leader's epochs go stale.
+   - It attempts to write the next epoch with `PutMode::Create`. If it succeeds, it becomes leader; if another node got there first, it stays a follower.
 
-5. **Following Epochs**: Followers continuously fetch and apply new WAL files (`epoch + 1`) to stay updated with the leader.
+7. **Epoch advancement**: The leader captures a changeset each tick and writes a new epoch atomically. A failed write means another leader has taken over — this node is fenced off and demotes itself.
 
-6. **Leader Election**:
-
-   - A node started in leader mode waits for the previous leader to step down or become inactive.
-   - If it successfully writes the next epoch, it becomes the new leader, otherwise it remains a follower.
-
-7. **Epoch Advancement**: The leader writes a new WAL file for each epoch. This is an atomic operation: if it fails, it indicates that another leader has already taken over, and this one has been fenced off.
+```
+{prefix}epochs/{epoch:020}      # lz4+protobuf WalEpoch (Changeset | Migration)
+{prefix}snapshots/{epoch:020}   # VACUUM INTO copy
+{prefix}last_snapshot
+{prefix}epoch_watermark
+```
 
 ## Example
 
-There is a `lol_cluster` example you can start locally:
+There is a `demo` example you can run locally. The first node creates the object store and becomes leader; additional nodes join as followers.
 
-First create a fake object store in your file system
+```bash
+# terminal 1 — first node (creates store, initializes DB, becomes leader)
+cargo run --example demo -- --object-store /tmp/lbc-store --id node-a --addr 127.0.0.1:5001
+# web UI: http://127.0.0.1:6001
 
-```
-mkdir -p /tmp/lol
-```
+# terminal 2 — follower
+cargo run --example demo -- --object-store /tmp/lbc-store --id node-b --addr 127.0.0.1:5002
+# web UI: http://127.0.0.1:6002
 
-Then initialize the cluster:
-
-```
-
-$ cargo run --example lol_cluster -- -p /tmp/lol init
-
-2024-10-06T23:10:01.765891Z  INFO lol_cluster: Initializing cluster...
-2024-10-06T23:10:01.830268Z  INFO lol_cluster: Cluster initialized!
+# or S3 (uses AWS_* env vars)
+cargo run --example demo -- --object-store s3://my-bucket/lbc/demo --id node-a --addr 127.0.0.1:5001
 ```
 
-You can then start leader and follower nodes:
+Each node serves a plain HTML UI on port **gRPC + 1000** (5001 → 6001). Run SQL from the leader; `SELECT` works on any node.
 
-```
-$ cargo run --example lol_cluster -- -p /tmp/lol leader
+Run the test suite:
 
-2024-10-06T23:10:16.499624Z  INFO lol_cluster::leader: Joining cluster...
-2024-10-06T23:10:16.499647Z  INFO lol_cluster::leader: Joined cluster! Listening on http://192.168.1.175:40243
-2024-10-06T23:10:16.500117Z  INFO lol_cluster::utils: Initial members:
-
-┌───┬──────────────────────────────────────┬─────────────────────┬─────┬───────┐
-│   │ UUID(1)                              │ Address             │ AZ  │ Roles │
-├───┼──────────────────────────────────────┼─────────────────────┼─────┼───────┤
-│ * │ 0192671a-1830-77f0-98d6-66847b348915 │ 192.168.1.175:40243 │ AZ0 │       │
-└───┴──────────────────────────────────────┴─────────────────────┴─────┴───────┘
-
-2024-10-06T23:10:16.500137Z  INFO lol_cluster::leader: Waiting for leadership...
-2024-10-06T23:10:16.516264Z  INFO lol_cluster::leader: We are the new leader!
-2024-10-06T23:10:16.516448Z  INFO lol_cluster::utils: Leader changed:
-
-┌───┬──────────────────────────────────────┬─────────────────────┬─────┬───────┐
-│   │ UUID(1)                              │ Address             │ AZ  │ Roles │
-├───┼──────────────────────────────────────┼─────────────────────┼─────┼───────┤
-│ * │ 0192671a-1830-77f0-98d6-66847b348915 │ 192.168.1.175:40243 │ AZ0 │       │
-└───┴──────────────────────────────────────┴─────────────────────┴─────┴───────┘
+```bash
+cargo test --workspace
 ```
 
-```
-$ cargo run --example lol_cluster -- -p /tmp/lol follower
+## Crates
 
-2024-10-06T23:10:36.508850Z  INFO lol_cluster::follower: Joining cluster...
-2024-10-06T23:10:36.646191Z  INFO lol_cluster::follower: Joined cluster! Listening on http://192.168.1.175:45135
-2024-10-06T23:10:36.646685Z  INFO lol_cluster::utils: Initial members:
+| Crate | Role |
+|-------|------|
+| `lbc-db` | Replication engine — epoch chain, changesets, snapshots, leader election |
+| `lbc-cluster` | Node orchestration — tick loop, gRPC membership client and service |
 
-┌───┬──────────────────────────────────────┬─────────────────────┬─────┬───────┐
-│   │ UUID(1)                              │ Address             │ AZ  │ Roles │
-├───┼──────────────────────────────────────┼─────────────────────┼─────┼───────┤
-│ * │ 0192671a-66dc-7340-b550-393f01d5b57e │ 192.168.1.175:45135 │ AZ0 │       │
-└───┴──────────────────────────────────────┴─────────────────────┴─────┴───────┘
+## Schema contract
 
-2024-10-06T23:10:36.647739Z  INFO lol_cluster::utils: Members changed:
+- Every replicated table must have a **PRIMARY KEY** (required by the SQLite changeset extension).
+- All application DDL — including the initial schema — ships as ordered **Migration** epochs (`schema_version` in `_lbc_meta`). Ad-hoc DDL in `write()` is rejected.
 
-┌───┬──────────────────────────────────────┬─────────────────────┬─────┬───────┐
-│   │ UUID(2)                              │ Address             │ AZ  │ Roles │
-├───┼──────────────────────────────────────┼─────────────────────┼─────┼───────┤
-│   │ 0192671a-1830-77f0-98d6-66847b348915 │ 192.168.1.175:40243 │ AZ0 │       │
-│ * │ 0192671a-66dc-7340-b550-393f01d5b57e │ 192.168.1.175:45135 │ AZ0 │       │
-└───┴──────────────────────────────────────┴─────────────────────┴─────┴───────┘
-```
+## Prior art
 
-You can now keep adding more followers (or standby leaders) and see how they join the cluster.
-
-## Prior Art
-
-- **Litestream**: Inspired the idea of replicating a SQLite database by physically replicating WAL files, similar to the approach used here.
-- **DeltaLake**: Shares the concept of using an object store as the only dependency. The protocol here is similar, though we do not expect write conflicts under normal operations (_but conflict detection follows a similar approach_).
+- **Litestream**: Inspired the idea of replicating a SQLite database by replicating its write log. This library uses logical changesets instead of physical WAL files.
+- **Delta Lake**: Shares the concept of using an object store as the only dependency. The epoch protocol is similar, though write conflicts are not expected under normal operations (conflict detection follows a similar approach).
 
 ## License
 

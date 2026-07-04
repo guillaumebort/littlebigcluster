@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package lbc.epoch;
+
+// On-disk epoch metadata and body written to `{prefix}epochs/{epoch:020}`.
+message EpochMetadata {
+  uint64 epoch = 1;
+  string leader_id = 2;
+  string leader_addr = 3;
+  string created_at = 4;
+  uint32 format_version = 5;
+}
+
+message WalEpoch {
+  EpochMetadata metadata = 1;
+  oneof body {
+    Changeset changeset = 2;
+    Migration migration = 3;
+  }
+}
+
+message Changeset {
+  bytes data = 1;
+}
+
+message Migration {
+  uint32 version = 1;
+  repeated string sql = 2;
+}

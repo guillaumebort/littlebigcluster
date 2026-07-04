@@ -1,0 +1,26 @@
+[package]
+name = "lbc-cluster"
+description = "Cluster node orchestration and membership for littlebigcluster"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lbc-db = { path = "../db" }
+object_store = { workspace = true }
+prost = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+dashmap = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+object_store = { version = "0.11.2", features = ["aws"] }
+tokio = { workspace = true, features = ["test-util", "macros"] }
