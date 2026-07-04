@@ -73,13 +73,52 @@ cargo test --workspace
 
 | Crate | Role |
 |-------|------|
+| `lbc` | Public API — re-exports the types you need to build a cluster app |
 | `lbc-db` | Replication engine — epoch chain, changesets, snapshots, leader election |
 | `lbc-cluster` | Node orchestration — tick loop, gRPC membership client and service |
 
-## Schema contract
+## Schema and migrations
 
-- Every replicated table must have a **PRIMARY KEY** (required by the SQLite changeset extension).
-- All application DDL — including the initial schema — ships as ordered **Migration** epochs (`schema_version` in `_lbc_meta`). Ad-hoc DDL in `write()` is rejected.
+All application DDL — including the initial schema — ships as ordered [`Migration`](crates/db/src/migrations.rs) epochs. The leader applies each migration locally, then writes a **Migration** WAL epoch to the object store; followers replay the same SQL when they sync that epoch. The applied version is tracked in `_lbc_meta` under key `schema_version`.
+
+### How migrations run
+
+- Migrations ship on **`initialize()`** (first node creating a cluster) and **`try_promote()`** (when a node becomes leader) — not on every tick.
+- The leader picks pending migrations where `version > schema_version`, applies them locally, and writes one Migration epoch per migration.
+- Followers never ship migrations; they apply SQL from replicated epochs.
+- Ad-hoc DDL inside `write()` is rejected.
+
+### Hard constraints 
+
+- Every replicated table must have a **PRIMARY KEY** (required by the SQLite session/changeset extension, verified by the migration framework).
+- Schema is **forward-only** — there are no down-migrations.
+
+### Application responsibilities
+
+- Ship the **same ordered migration list** in every node binary.
+- Use **expand/contract** migrations for rolling deploys and app rollbacks:
+  1. **Expand** — add nullable columns or new tables; old code keeps working.
+  2. **Contract** — drop deprecated columns in a later release, after all nodes run the new code.
+- Set `with_min_schema_version(n)` when an old binary must refuse a DB that has already moved forward (e.g. after an app rollback).
+
+### Progressive rollout
+
+1. Ship an expand-only migration in the new binary (same list on every node).
+2. Roll out the new binary in any order (e.g. a Kubernetes rolling update).
+3. The migration ships when a v2-eligible node next **promotes** — not on every pod restart. Until then, the cluster stays on the old schema and v1 pods keep working.
+4. After promotion, every node applies the migration epoch; v1 pods must still tolerate the expanded schema until they are replaced.
+5. Ship contract migrations only in a later release, when rollback to the old binary is no longer needed.
+
+Restarting an old pod after the schema has advanced will fail at `Db::join` if the DB is outside that binary's supported range — which is intentional.
+
+### Framework support
+
+Each node declares a supported schema range via its migration list and optional `min_schema_version`:
+
+- **`max`** — highest `Migration.version` in the binary (what it can ship).
+- **`min`** — optional floor via `Config::with_min_schema_version` / `NodeConfig::with_min_schema_version`.
+
+At **`Db::join`**, the framework fails fast if the local DB's `schema_version` is outside that range. Membership advertises per-node `schema_version`, `schema_min`, and `schema_max` in the cluster roster (visible in the demo UI).
 
 ## Prior art
 

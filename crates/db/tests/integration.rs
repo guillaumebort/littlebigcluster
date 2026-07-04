@@ -239,3 +239,94 @@ async fn write_rejects_ad_hoc_ddl() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn join_rejects_db_newer_than_binary() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let object_store = store(&root.path().join("store"));
+
+    let migrations = vec![
+        kv_migration(),
+        Migration {
+            version: 2,
+            sql: vec!["CREATE TABLE IF NOT EXISTS extra (
+                    id INTEGER PRIMARY KEY,
+                    note TEXT NOT NULL
+                );"
+            .into()],
+        },
+    ];
+
+    let leader_cfg = Config::new(
+        object_store.clone(),
+        "schema/",
+        root.path().join("leader"),
+        "node-a",
+        "127.0.0.1:5001",
+    )
+    .with_migrations(migrations.clone())
+    .with_snapshot_every_epochs(100);
+
+    let leader = Db::join(leader_cfg).await?;
+    assert_eq!(leader.store().schema_version()?, 2);
+
+    let follower_cfg = Config::new(
+        object_store,
+        "schema/",
+        root.path().join("follower"),
+        "node-b",
+        "127.0.0.1:5002",
+    )
+    .with_migrations(vec![kv_migration()])
+    .with_snapshot_every_epochs(100);
+
+    let err = match Db::join(follower_cfg).await {
+        Err(e) => e,
+        Ok(_) => panic!("expected join to fail for newer DB schema"),
+    };
+    assert!(
+        err.to_string().contains("newer than this binary supports"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn join_rejects_db_below_minimum() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let object_store = store(&root.path().join("store"));
+
+    let leader_cfg = Config::new(
+        object_store.clone(),
+        "min/",
+        root.path().join("leader"),
+        "node-a",
+        "127.0.0.1:5001",
+    )
+    .with_migrations(vec![kv_migration()])
+    .with_snapshot_every_epochs(100);
+
+    let leader = Db::join(leader_cfg).await?;
+    assert_eq!(leader.store().schema_version()?, 1);
+
+    let follower_cfg = Config::new(
+        object_store,
+        "min/",
+        root.path().join("follower"),
+        "node-b",
+        "127.0.0.1:5002",
+    )
+    .with_migrations(vec![kv_migration()])
+    .with_min_schema_version(2)
+    .with_snapshot_every_epochs(100);
+
+    let err = match Db::join(follower_cfg).await {
+        Err(e) => e,
+        Ok(_) => panic!("expected join to fail for newer DB schema"),
+    };
+    assert!(
+        err.to_string().contains("below this binary's minimum"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}

@@ -1,6 +1,7 @@
 //! Cluster node orchestration and membership.
 
 pub mod proto {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("lbc.cluster");
 }
 

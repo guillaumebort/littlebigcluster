@@ -13,6 +13,9 @@ pub struct Member {
     pub az: String,
     pub epoch: u64,
     pub capabilities: Vec<String>,
+    pub schema_version: u32,
+    pub schema_min: u32,
+    pub schema_max: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,10 +69,13 @@ impl Registry {
         Ok(session)
     }
 
-    pub fn heartbeat(&self, node_id: &str, epoch: u64) {
+    pub fn heartbeat(&self, node_id: &str, epoch: u64, schema_version: u32) {
         let changed = match self.members.get_mut(node_id) {
-            Some(mut entry) if entry.member.epoch != epoch => {
+            Some(mut entry)
+                if entry.member.epoch != epoch || entry.member.schema_version != schema_version =>
+            {
                 entry.member.epoch = epoch;
+                entry.member.schema_version = schema_version;
                 true
             }
             _ => false,
@@ -122,6 +128,9 @@ mod tests {
             az: "az-a".into(),
             epoch: 1,
             capabilities: vec![],
+            schema_version: 0,
+            schema_min: 0,
+            schema_max: 0,
         }
     }
 

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::proto::cluster_client::ClusterClient;
 use crate::proto::{membership_request, Heartbeat, Join, MembershipEvent, MembershipRequest};
+use lbc_db::SchemaSupport;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
@@ -21,6 +22,7 @@ pub struct Client {
     addr: String,
     az: String,
     capabilities: Vec<String>,
+    schema_support: SchemaSupport,
     view: watch::Receiver<ClusterView>,
     roster_tx: watch::Sender<Arc<Vec<Member>>>,
     registry: Registry,
@@ -34,6 +36,7 @@ impl Client {
         addr: impl Into<String>,
         az: impl Into<String>,
         capabilities: Vec<String>,
+        schema_support: SchemaSupport,
         view: watch::Receiver<ClusterView>,
         roster_tx: watch::Sender<Arc<Vec<Member>>>,
         registry: Registry,
@@ -44,6 +47,7 @@ impl Client {
             addr: addr.into(),
             az: az.into(),
             capabilities,
+            schema_support,
             view,
             roster_tx,
             registry,
@@ -133,8 +137,9 @@ impl Client {
                     if !view.is_leader {
                         break;
                     }
-                    // Keep our epoch fresh; heartbeat does not re-broadcast.
-                    self.registry.heartbeat(&self.node_id, view.epoch);
+                    // Keep our epoch and schema version fresh; heartbeat does not re-broadcast.
+                    self.registry
+                        .heartbeat(&self.node_id, view.epoch, view.schema_version);
                 }
             }
         }
@@ -144,12 +149,16 @@ impl Client {
     }
 
     fn self_member(&self) -> Member {
+        let view = self.view.borrow();
         Member {
             node_id: self.node_id.clone(),
             addr: self.addr.clone(),
             az: self.az.clone(),
-            epoch: self.view.borrow().epoch,
+            epoch: view.epoch,
             capabilities: self.capabilities.clone(),
+            schema_version: view.schema_version,
+            schema_min: self.schema_support.min,
+            schema_max: self.schema_support.max,
         }
     }
 
@@ -163,10 +172,14 @@ impl Client {
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
-                    let epoch = self.view.borrow().epoch;
+                    let (epoch, schema_version) = {
+                        let view = self.view.borrow();
+                        (view.epoch, view.schema_version)
+                    };
                     let hb = MembershipRequest {
                         request: Some(membership_request::Request::Heartbeat(Heartbeat {
                             epoch,
+                            schema_version,
                         })),
                     };
                     if tx.send(hb).await.is_err() {
@@ -216,13 +229,20 @@ impl Client {
         let mut client = ClusterClient::new(channel);
 
         let (tx, rx) = mpsc::channel(32);
+        let (epoch, schema_version) = {
+            let view = self.view.borrow();
+            (view.epoch, view.schema_version)
+        };
         let join = MembershipRequest {
             request: Some(membership_request::Request::Join(Join {
                 node_id: self.node_id.clone(),
                 addr: self.addr.clone(),
                 az: self.az.clone(),
-                epoch: self.view.borrow().epoch,
+                epoch,
                 capabilities: self.capabilities.clone(),
+                schema_version,
+                schema_min: self.schema_support.min,
+                schema_max: self.schema_support.max,
             })),
         };
         tx.send(join)
@@ -248,6 +268,9 @@ impl From<crate::proto::Member> for Member {
             az: m.az,
             epoch: m.epoch,
             capabilities: m.capabilities,
+            schema_version: m.schema_version,
+            schema_min: m.schema_min,
+            schema_max: m.schema_max,
         }
     }
 }

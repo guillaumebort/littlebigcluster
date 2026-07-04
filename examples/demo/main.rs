@@ -18,8 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use lbc_cluster::{Node, NodeConfig};
-use lbc_db::Migration;
+use lbc::{Migration, Node, NodeConfig};
 use object_store::local::LocalFileSystem;
 use object_store::{parse_url, ObjectStore};
 use tempfile::TempDir;

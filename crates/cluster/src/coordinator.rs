@@ -23,6 +23,7 @@ pub struct ClusterView {
     pub leader_id: String,
     pub leader_addr: String,
     pub epoch: u64,
+    pub schema_version: u32,
 }
 
 /// Configuration for joining a cluster node.
@@ -34,6 +35,7 @@ pub struct NodeConfig {
     pub object_store: Arc<dyn ObjectStore>,
     pub local_root: PathBuf,
     pub migrations: Vec<Migration>,
+    pub min_schema_version: u32,
     pub leader_eligible: bool,
     pub epoch_interval: Duration,
     pub snapshot_every_epochs: u64,
@@ -56,6 +58,7 @@ impl NodeConfig {
             object_store,
             local_root: local_root.into(),
             migrations: Vec::new(),
+            min_schema_version: 0,
             leader_eligible: true,
             epoch_interval: Duration::from_secs(1),
             snapshot_every_epochs: 300,
@@ -65,6 +68,11 @@ impl NodeConfig {
 
     pub fn with_migrations(mut self, migrations: Vec<Migration>) -> Self {
         self.migrations = migrations;
+        self
+    }
+
+    pub fn with_min_schema_version(mut self, min: u32) -> Self {
+        self.min_schema_version = min;
         self
     }
 
@@ -133,10 +141,15 @@ impl Node {
             &config.node_addr,
         )
         .with_migrations(config.migrations.clone())
+        .with_min_schema_version(config.min_schema_version)
         .with_leader_eligible(config.leader_eligible)
         .with_snapshot_every_epochs(config.snapshot_every_epochs);
 
         let db = Arc::new(Mutex::new(Db::join(db_config).await?));
+        let schema_support = {
+            let db = db.lock().await;
+            db.schema_support()
+        };
         let (view_tx, view_rx) = watch::channel(ClusterView::default());
         let registry = Registry::new();
         let (members_tx, _) = watch::channel(Arc::new(Vec::new()));
@@ -156,6 +169,7 @@ impl Node {
             config.node_addr.clone(),
             config.az.clone(),
             config.capabilities.clone(),
+            schema_support,
             view_rx.clone(),
             members_tx.clone(),
             registry.clone(),
@@ -209,6 +223,7 @@ impl Node {
                             config.node_addr.clone(),
                             config.az.clone(),
                             config.capabilities.clone(),
+                            schema_support,
                             view_rx.clone(),
                             members_tx_loop.clone(),
                             registry_loop.clone(),
@@ -233,10 +248,12 @@ impl Node {
 
 fn publish_view(tx: &watch::Sender<ClusterView>, db: &Db) {
     let (leader_id, leader_addr) = db.leader();
+    let schema_version = db.store().schema_version().unwrap_or(0);
     let _ = tx.send(ClusterView {
         is_leader: db.is_leader(),
         leader_id,
         leader_addr,
         epoch: db.epoch(),
+        schema_version,
     });
 }

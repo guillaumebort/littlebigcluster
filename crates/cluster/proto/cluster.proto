@@ -21,10 +21,14 @@ message Join {
   string az = 3;
   uint64 epoch = 4;
   repeated string capabilities = 5;
+  uint32 schema_version = 6;
+  uint32 schema_min = 7;
+  uint32 schema_max = 8;
 }
 
 message Heartbeat {
   uint64 epoch = 1;
+  uint32 schema_version = 2;
 }
 
 message MembershipEvent {
@@ -37,4 +41,7 @@ message Member {
   string az = 3;
   uint64 epoch = 4;
   repeated string capabilities = 5;
+  uint32 schema_version = 6;
+  uint32 schema_min = 7;
+  uint32 schema_max = 8;
 }

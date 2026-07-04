@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/db", "crates/cluster", "."]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [workspace.dependencies]
@@ -25,14 +25,16 @@ dashmap = "6"
 uuid = { version = "1.10", features = ["v4"] }
 
 [package]
-name = "littlebigcluster"
+name = "lbc"
+description = "Replicated SQLite cluster over an object store"
 version.workspace = true
 edition.workspace = true
-publish = false
 
 [dependencies]
 lbc-cluster = { path = "crates/cluster" }
 lbc-db = { path = "crates/db" }
+
+[dev-dependencies]
 object_store = { workspace = true, features = ["aws"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }

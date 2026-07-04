@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use lbc_cluster::{ClusterView, Member};
+use lbc::{ClusterView, Member};
 use tracing::info;
 
 pub fn setup_tracing(verbose: u8) {
@@ -43,7 +43,10 @@ pub fn log_members(msg: &str, self_id: &str, view: &ClusterView, members: &Arc<V
                 ""
             };
             let me = if m.node_id == self_id { " (self)" } else { "" };
-            format!("{} {} {}{leader}{me}", m.node_id, m.addr, m.az)
+            format!(
+                "{} {} {} schema={} supports={}–{}{leader}{me}",
+                m.node_id, m.addr, m.az, m.schema_version, m.schema_min, m.schema_max
+            )
         })
         .collect::<Vec<_>>()
         .join(", ");

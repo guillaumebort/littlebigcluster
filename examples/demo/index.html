@@ -19,14 +19,18 @@
         <th>addr</th>
         <th>az</th>
         <th>epoch</th>
+        <th>schema</th>
+        <th>supports</th>
       </tr>
       {% for m in members %}
-      <tr{% if m.is_leader %} style="font-weight:bold"{% endif %}>
+      <tr{% if !m.row_style.is_empty() %} style="{{ m.row_style }}"{% endif %}>
         <td>{{ m.mark }}</td>
         <td>{{ m.id }}{{ m.leader_suffix }}</td>
         <td>{{ m.addr }}</td>
         <td>{{ m.az }}</td>
         <td>{{ m.epoch }}</td>
+        <td>{{ m.schema_version }}</td>
+        <td>{{ m.schema_support }}</td>
       </tr>
       {% endfor %}
     </table>

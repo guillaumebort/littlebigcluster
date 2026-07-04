@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use epoch::{
     decode_wal_epoch, encode_wal_epoch, validate_format_version, Epoch, EpochBody, WalEpoch,
 };
-use migrations::{validate_migrations, Migrations};
+use migrations::{validate_migrations, validate_schema, Migrations};
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
 use rusqlite::Connection;
 use tokio::sync::watch;
@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 pub use clock::{Clock, SystemClock, TestClock};
 pub use epoch::WalEpoch as WalEpochFormat;
 pub use housekeeping::{HousekeepingStats, RetentionConfig};
-pub use migrations::Migration;
+pub use migrations::{Migration, SchemaSupport};
 pub use sqlite::SqliteStore;
 
 pub const DEFAULT_EPOCH_INTERVAL: Duration = Duration::from_secs(1);
@@ -47,6 +47,7 @@ pub struct Config {
     pub stale_threshold_epochs: u64,
     pub leader_eligible: bool,
     pub snapshot_every_epochs: u64,
+    pub min_schema_version: u32,
 }
 
 impl Config {
@@ -70,7 +71,13 @@ impl Config {
             stale_threshold_epochs: DEFAULT_STALE_THRESHOLD_EPOCHS,
             leader_eligible: true,
             snapshot_every_epochs: 300,
+            min_schema_version: 0,
         }
+    }
+
+    pub fn with_min_schema_version(mut self, min: u32) -> Self {
+        self.min_schema_version = min;
+        self
     }
 
     pub fn with_migrations(mut self, migrations: Vec<Migration>) -> Self {
@@ -120,6 +127,7 @@ pub struct Db {
     leader_eligible: bool,
     snapshot_every_epochs: u64,
     migrations: Migrations,
+    schema_support: SchemaSupport,
 
     store: Arc<SqliteStore>,
     last_epoch: Epoch,
@@ -136,6 +144,8 @@ pub struct Db {
 impl Db {
     pub async fn join(config: Config) -> Result<Self> {
         validate_migrations(&config.migrations)?;
+        let schema_support =
+            SchemaSupport::from_migrations(&config.migrations, config.min_schema_version);
 
         let Config {
             object_store,
@@ -150,6 +160,7 @@ impl Db {
             stale_threshold_epochs,
             leader_eligible,
             snapshot_every_epochs,
+            min_schema_version: _,
         } = config;
 
         let prefix = normalize_prefix(&prefix);
@@ -184,6 +195,7 @@ impl Db {
                 leader_eligible,
                 snapshot_every_epochs,
                 migrations,
+                schema_support,
                 store,
                 last_epoch,
                 initialized_fresh: true,
@@ -196,6 +208,7 @@ impl Db {
                 leader_state_tx,
             };
             db.initialize().await?;
+            validate_schema(db.store.schema_version()?, &db.schema_support)?;
             warn!("promoted to leader for {}", db.prefix);
             Ok(db)
         } else {
@@ -223,6 +236,7 @@ impl Db {
                 leader_eligible,
                 snapshot_every_epochs,
                 migrations,
+                schema_support,
                 store: result.store,
                 last_epoch: result.last_epoch,
                 initialized_fresh: false,
@@ -234,6 +248,7 @@ impl Db {
                 followed_leader: None,
                 leader_state_tx,
             };
+            validate_schema(db.store.schema_version()?, &db.schema_support)?;
             if leader_eligible
                 && db.is_epoch_stale()
                 && matches!(db.try_promote().await?, TickResult::Promoted)
@@ -246,6 +261,10 @@ impl Db {
 
     pub fn store(&self) -> Arc<SqliteStore> {
         self.store.clone()
+    }
+
+    pub fn schema_support(&self) -> SchemaSupport {
+        self.schema_support
     }
 
     pub fn initialized_fresh(&self) -> bool {

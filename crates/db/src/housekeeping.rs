@@ -95,8 +95,10 @@ pub async fn run_housekeeping(
     snapshots.sort_by_key(|(e, _)| *e);
 
     let keep = decide_snapshots_to_keep(&snapshots, now, config);
-    let mut stats = HousekeepingStats::default();
-    stats.oldest_retained_snapshot_epoch = keep.iter().copied().min().unwrap_or(latest_snapshot);
+    let mut stats = HousekeepingStats {
+        oldest_retained_snapshot_epoch: keep.iter().copied().min().unwrap_or(latest_snapshot),
+        ..Default::default()
+    };
 
     for (epoch, _) in &snapshots {
         if keep.contains(epoch) {

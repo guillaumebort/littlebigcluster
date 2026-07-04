@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::Form;
-use lbc_cluster::NodeHandle;
+use lbc::NodeHandle;
 use rusqlite::Connection;
 use serde::Deserialize;
 
@@ -31,7 +31,7 @@ pub enum SqlOutcome {
 }
 
 #[derive(Template)]
-#[template(path = "../examples/demo/index.html")]
+#[template(path = "index.html")]
 struct IndexTemplate {
     is_leader: bool,
     members: Vec<MemberRow>,
@@ -43,10 +43,12 @@ struct MemberRow {
     mark: &'static str,
     id: String,
     leader_suffix: &'static str,
-    is_leader: bool,
+    row_style: String,
     addr: String,
     az: String,
     epoch: u64,
+    schema_version: u32,
+    schema_support: String,
 }
 
 struct SchemaRow {
@@ -116,18 +118,27 @@ async fn render(app: &App, result: Option<&SqlOutcome>) -> Result<String, askama
         is_leader: view.is_leader,
         members: members
             .iter()
-            .map(|m| MemberRow {
-                mark: if m.node_id == app.node_id { "*" } else { "" },
-                id: m.node_id.clone(),
-                leader_suffix: if m.node_id == view.leader_id {
-                    " (leader)"
-                } else {
-                    ""
-                },
-                is_leader: m.node_id == view.leader_id,
-                addr: m.addr.clone(),
-                az: m.az.clone(),
-                epoch: m.epoch,
+            .map(|m| {
+                let incompatible = m.schema_max > 0 && m.schema_version > m.schema_max;
+                let is_leader = m.node_id == view.leader_id;
+                let mut styles = Vec::new();
+                if is_leader {
+                    styles.push("font-weight:bold");
+                }
+                if incompatible {
+                    styles.push("background:#fdd");
+                }
+                MemberRow {
+                    mark: if m.node_id == app.node_id { "*" } else { "" },
+                    id: m.node_id.clone(),
+                    leader_suffix: if is_leader { " (leader)" } else { "" },
+                    row_style: styles.join(";"),
+                    addr: m.addr.clone(),
+                    az: m.az.clone(),
+                    epoch: m.epoch,
+                    schema_version: m.schema_version,
+                    schema_support: format!("{}–{}", m.schema_min, m.schema_max),
+                }
             })
             .collect(),
         schema,

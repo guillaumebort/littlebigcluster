@@ -82,8 +82,19 @@ async fn handle_stream(
         az: join.az,
         epoch: join.epoch,
         capabilities: join.capabilities,
+        schema_version: join.schema_version,
+        schema_min: join.schema_min,
+        schema_max: join.schema_max,
     }) {
         Ok(session) => {
+            if join.schema_max > 0 && join.schema_version > join.schema_max {
+                warn!(
+                    node_id = %node_id,
+                    schema_version = join.schema_version,
+                    schema_max = join.schema_max,
+                    "member schema version exceeds its supported maximum"
+                );
+            }
             debug!(node_id = %node_id, addr = %addr, "member joined");
             session
         }
@@ -116,7 +127,7 @@ async fn handle_stream(
             incoming = in_stream.next() => match incoming {
                 Some(Ok(MembershipRequest {
                     request: Some(membership_request::Request::Heartbeat(hb)),
-                })) => registry.heartbeat(&node_id, hb.epoch),
+                })) => registry.heartbeat(&node_id, hb.epoch, hb.schema_version),
                 Some(Ok(_)) => {}
                 Some(Err(_)) | None => break,
             },
@@ -154,5 +165,8 @@ fn proto_member(m: &Member) -> ProtoMember {
         az: m.az.clone(),
         epoch: m.epoch,
         capabilities: m.capabilities.clone(),
+        schema_version: m.schema_version,
+        schema_min: m.schema_min,
+        schema_max: m.schema_max,
     }
 }

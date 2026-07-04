@@ -142,6 +142,9 @@ unsafe fn extend_session<'conn>(session: Session<'conn>) -> Session<'static> {
     std::mem::transmute(session)
 }
 
+type WriteValue = Box<dyn std::any::Any + Send>;
+type WriteWork = Box<dyn FnOnce(&Connection) -> Result<WriteValue> + Send>;
+
 enum WriterRequest {
     CaptureChangeset(mpsc::Sender<Result<Vec<u8>>>),
     CommitEpoch(mpsc::Sender<Result<()>>),
@@ -151,8 +154,8 @@ enum WriterRequest {
         reply: mpsc::Sender<Result<()>>,
     },
     WithWriteValue {
-        work: Box<dyn FnOnce(&Connection) -> Result<Box<dyn std::any::Any + Send>> + Send>,
-        reply: mpsc::Sender<Result<Box<dyn std::any::Any + Send>>>,
+        work: WriteWork,
+        reply: mpsc::Sender<Result<WriteValue>>,
     },
     ApplyChangeset {
         bytes: Vec<u8>,
@@ -541,7 +544,7 @@ impl SqliteStore {
     }
 
     pub fn schema_version(&self) -> Result<u32> {
-        self.with_read(|conn| ensure_meta(conn))
+        self.with_read(ensure_meta)
     }
 }
 
